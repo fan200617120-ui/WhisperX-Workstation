@@ -2,7 +2,7 @@
 WhisperX Studio – All-in-One Speech &amp; Subtitle Workstation
 # 🎙️ WhisperX 语音字幕工作站 – 使用手册
 
-> 轻舟渡万境，一智载千灵  
+> 轻舟渡万境，一智载千寻 
 > 基于 FireRedASR2S 二次开发，整合语音识别、字幕处理、AI 翻译、格式转换等一站式工具集。
 
 ---
@@ -302,4 +302,4 @@ limitations under the License.
 链接: https://pan.baidu.com/s/1QAfmoKyrsb0xK6ACAY8ENg?pwd=6688 提取码: 6688
 
 
-*轻舟渡万境，一智载千灵 — 愿你的创作如行云流水。*
+*轻舟渡万境，一智载千寻 — 愿你的创作如行云流水。*
