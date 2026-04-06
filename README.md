@@ -37,7 +37,7 @@ WhisperX Studio – All-in-One Speech &amp; Subtitle Workstation
 所有工具均采用便携式设计，解压即用，无需额外配置 Python 环境。
 
 ---
-
+![WhisperX-Workstation 计算精度设置界面](https://raw.githubusercontent.com/fan200617120-ui/WhisperX-Workstation/main/image/2026-04-06_234604.png)
 ## 系统要求
 
 | 组件 | 最低要求 | 推荐配置 |
