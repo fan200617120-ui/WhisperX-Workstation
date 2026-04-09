@@ -21,6 +21,8 @@ import gradio as gr
 import subprocess
 import sys
 import time
+import os
+import argparse
 from pathlib import Path
 
 # ==================== 配置路径 ====================
@@ -30,6 +32,8 @@ if not PYTHON_EXE.exists():
     PYTHON_EXE = sys.executable  # 降级到系统 Python
 
 SCRIPTS_DIR = BASE_DIR / "core"
+OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)  # 确保输出目录存在
 
 def launch_script(script_name):
     """启动指定脚本"""
@@ -41,6 +45,22 @@ def launch_script(script_name):
         return f"✅ 已启动 {script_name}，请查看新窗口"
     except Exception as e:
         return f"❌ 启动失败：{e}"
+
+def open_folder(path):
+    """使用系统文件管理器打开文件夹"""
+    folder = Path(path)
+    if not folder.exists():
+        return f"❌ 目录不存在：{path}"
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(folder))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+        return f"📂 已打开：{folder}"
+    except Exception as e:
+        return f"❌ 打开失败：{e}"
 
 def refresh_status():
     """刷新系统状态（可扩展为获取CPU/内存等信息）"""
@@ -145,9 +165,9 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
         # 按钮组
         with gr.Column(elem_classes="btn-group"):
             btn_asr = gr.Button("📄 语音转字幕", elem_id="btn_asr")
+            btn_align = gr.Button("🎯 语音转字幕（对齐）", elem_id="btn_align")  # 新增对齐脚本按钮
             btn_clean = gr.Button("✨ 字幕清洗", elem_id="btn_clean")
             btn_trans = gr.Button("🔤 字幕转换", elem_id="btn_trans")
-            # 新增按钮（请将对应的脚本放入 scripts 目录）
             btn_translate = gr.Button("🤖 在线AI助手", elem_id="btn_translate")
             btn_json_extract = gr.Button("📋 双语字幕API版", elem_id="btn_json_extract")
 
@@ -158,6 +178,11 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
             elem_classes="status",
             interactive=False
         )
+
+        # 新增快捷目录按钮
+        with gr.Row():
+            btn_open_root = gr.Button("📁 打开根目录", size="sm")
+            btn_open_output = gr.Button("📂 打开输出目录", size="sm")
 
         # 页脚版权与免责声明
         gr.HTML("""
@@ -188,15 +213,26 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
 
     # ==================== 绑定点击事件 ====================
     btn_asr.click(fn=lambda: launch_script("whisperX.py"), outputs=status)
+    btn_align.click(fn=lambda: launch_script("whisperX_sub_align.py"), outputs=status)  # 绑定对齐脚本
     btn_clean.click(fn=lambda: launch_script("clean_subtitle.py"), outputs=status)
     btn_trans.click(fn=lambda: launch_script("subtitle_utils.py"), outputs=status)
     btn_translate.click(fn=lambda: launch_script("AI_translator.py"), outputs=status)
-    btn_json_extract.click(fn=lambda: launch_script("subtitle_translator_pro.py"), outputs=status)    
+    btn_json_extract.click(fn=lambda: launch_script("subtitle_translator_pro.py"), outputs=status)
 
+    # 打开目录事件
+    btn_open_root.click(fn=lambda: open_folder(BASE_DIR), outputs=status)
+    btn_open_output.click(fn=lambda: open_folder(OUTPUT_DIR), outputs=status)
 
 if __name__ == "__main__":
+    # 解析命令行参数，支持指定端口（多网口备选可通过多次运行不同端口实现）
+    parser = argparse.ArgumentParser(description="语音字幕工作站 WebUI")
+    parser.add_argument("--port", type=int, default=7868,
+                        help="服务端口（默认 7868，可自定义如 7968、7988）")
+    args = parser.parse_args()
+
+    print(f"启动 WebUI 于端口 {args.port}，访问地址：http://127.0.0.1:{args.port}")
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7868,
+        server_port=args.port,
         inbrowser=True
     )
