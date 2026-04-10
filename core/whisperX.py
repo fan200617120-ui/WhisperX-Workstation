@@ -1,103 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-WhisperX WebUI 全功能版 - 自动扫描本地模型，支持多语种强制对齐
-包含：音频识别、视频字幕、批量处理、强制对齐（WhisperX精细对齐+回退算法）
-新增：热词/提示词功能（initial_prompt），多语种对齐模型选择
+字幕自动打轴独立 UI 版（支持多语种对齐模型选择 + 热词/提示词）
+基于 WhisperX，提供图形界面进行文稿与音频的强制对齐
 Copyright 2026 光影的故事2018
 """
 
 import sys
 import os
-import json
-import logging
-import traceback
-import time
-import gc
-import threading
-import atexit
-import tempfile
-import hashlib
 import re
-import base64
-import subprocess
+import time
+import json
 import shutil
-import html
+import gc
 from pathlib import Path
-from datetime import timedelta
 from typing import List, Dict, Optional, Tuple
 
-sys.setrecursionlimit(10000)
-
-# ==================== 日志设置 ====================
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-def clean_old_logs(days=7):
-    cutoff = time.time() - days * 24 * 3600
-    for f in LOG_DIR.glob("error_*.log"):
-        if f.stat().st_mtime < cutoff:
-            try:
-                f.unlink()
-            except:
-                pass
-
-clean_old_logs()
-log_file = LOG_DIR / f"error_{time.strftime('%Y%m%d')}.log"
-logging.basicConfig(filename=log_file, level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# ==================== 路径设置 ====================
+# 设置路径
 CURRENT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = CURRENT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-BASE_DIR = Path(__file__).parent.absolute()
-ROOT_DIR = BASE_DIR.parent
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "output"
-OUTPUT_DIR = DEFAULT_OUTPUT_DIR
-ALIGN_OUTPUT_DIR = OUTPUT_DIR / "字幕自动打轴"
-ALIGN_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-PRESET_DIR = ROOT_DIR / "preset"
-PRESET_DIR.mkdir(exist_ok=True)
-CONFIG_FILE = PRESET_DIR / "settings.json"
-config_lock = threading.RLock()
 
-# ==================== FFmpeg (跨平台) ====================
-PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
-if sys.platform == "win32":
-    PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg.exe"
-else:
-    PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg"
-
-if PORTABLE_FFMPEG_EXE.exists():
-    os.environ["PATH"] = str(PORTABLE_FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
-    FFMPEG_PATH = str(PORTABLE_FFMPEG_EXE)
-    print(f"[OK] 已自动加载内置 FFmpeg: {FFMPEG_PATH}")
-else:
-    system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
-        FFMPEG_PATH = system_ffmpeg
-        print(f"[OK] 使用系统已安装的 FFmpeg: {FFMPEG_PATH}")
-    else:
-        FFMPEG_PATH = "ffmpeg"
-        print("[WARN] 未找到内置 FFmpeg，视频处理可能失败，请将 ffmpeg 放入 ffmpeg/bin 目录。")
-
-def load_settings():
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_settings(settings):
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
-# ==================== 导入依赖 ====================
+# 导入依赖
 try:
     import gradio as gr
     import torch
@@ -105,33 +29,29 @@ try:
     import librosa
     import soundfile as sf
     from faster_whisper import WhisperModel
-    print(f"PyTorch: {torch.__version__}, CUDA可用: {torch.cuda.is_available()}")
-    print("faster-whisper: 已导入")
 except ImportError as e:
-    print(f"基础依赖缺失: {e}")
+    print(f"缺少基础依赖库: {e}")
+    print("请确保已安装 faster-whisper, gradio, librosa, soundfile")
     sys.exit(1)
 
 # 尝试导入 whisperx 对齐模块
 try:
     from whisperx import load_align_model, align
     WHISPERX_ALIGN_AVAILABLE = True
-    print("whisperx.align: 已导入")
 except ImportError:
     print("警告: 未找到 whisperx.align 模块，多语种精细对齐功能将不可用。")
     print("请运行: pip install whisperx")
     WHISPERX_ALIGN_AVAILABLE = False
 
 # ==================== 工具函数 ====================
-def seconds_to_srt_time(seconds):
-    td = timedelta(seconds=seconds)
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
-    ms = int((td.total_seconds() - total_seconds) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+def seconds_to_srt_time(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def words_to_srt(words_with_time):
+def words_to_srt(words_with_time: List[Dict]) -> str:
     lines = []
     for i, w in enumerate(words_with_time, 1):
         lines.append(str(i))
@@ -140,7 +60,7 @@ def words_to_srt(words_with_time):
         lines.append("")
     return "\n".join(lines)
 
-def sentences_to_srt(sentences):
+def sentences_to_srt(sentences: List[Dict]) -> str:
     lines = []
     for i, s in enumerate(sentences, 1):
         lines.append(str(i))
@@ -149,8 +69,8 @@ def sentences_to_srt(sentences):
         lines.append("")
     return "\n".join(lines)
 
-def force_align_char_level(reference_text, transcribed_words, audio_duration=None):
-    """字符级对齐（中文等）"""
+def force_align_char_level(reference_text: str, transcribed_words: List[Dict],
+                           audio_duration: Optional[float] = None) -> List[Dict]:
     if not transcribed_words:
         return []
     ref_chars = [ch for ch in reference_text if not ch.isspace()]
@@ -206,8 +126,8 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
         aligned.append({"word": r_char, "start": char_start, "end": char_end})
     return aligned
 
-def force_align_word_level(reference_text, transcribed_words, audio_duration=None):
-    """单词级对齐（英文等）"""
+def force_align_word_level(reference_text: str, transcribed_words: List[Dict],
+                           audio_duration: Optional[float] = None) -> List[Dict]:
     if not transcribed_words:
         return []
     ref_words = reference_text.split()
@@ -242,12 +162,12 @@ def force_align_word_level(reference_text, transcribed_words, audio_duration=Non
             aligned.append({"word": ref_w, "start": start, "end": end})
     return aligned
 
-def _generate_merged_srt(aligned_chars, sentences, paragraphs,
-                         merge_punctuations, merge_max_words, merge_max_chars,
-                         merge_max_duration, merge_by_newline,
-                         merge_by_punc, merge_by_silence, merge_by_wordcount,
-                         merge_by_charcount, merge_by_duration, silence_threshold):
-    """根据合并策略生成合并字幕"""
+def generate_merged_srt(aligned_chars: List[Dict], sentences: List[Dict], paragraphs: List[str],
+                        merge_punctuations: str, merge_max_words: int, merge_max_chars: int,
+                        merge_max_duration: float, merge_by_newline: bool,
+                        merge_by_punc: bool, merge_by_silence: bool, merge_by_wordcount: bool,
+                        merge_by_charcount: bool, merge_by_duration: bool,
+                        silence_threshold: float) -> str:
     if merge_by_newline:
         return sentences_to_srt(sentences)
     punc_set = set(merge_punctuations) if merge_punctuations else set()
@@ -291,192 +211,20 @@ def _generate_merged_srt(aligned_chars, sentences, paragraphs,
             })
     return sentences_to_srt(merged_segments)
 
-def format_result_to_outputs(result):
-    if not result or not isinstance(result, dict):
-        return "无结果", "{}", "", []
-    text = " ".join([seg["text"] for seg in result.get("segments", [])])
-    segments = result.get("segments", [])
-    timestamps_json = json.dumps(segments, ensure_ascii=False, indent=2)
-    srt_lines = []
-    for i, seg in enumerate(segments, 1):
-        start = seconds_to_srt_time(seg["start"])
-        end = seconds_to_srt_time(seg["end"])
-        srt_lines.append(str(i))
-        srt_lines.append(f"{start} --> {end}")
-        srt_lines.append(seg["text"])
-        srt_lines.append("")
-    srt_text = "\n".join(srt_lines)
-    extra = f"语言: {result.get('language', '未知')} (概率: {result.get('language_probability', 0):.2f})"
-    full_text = f"{text}\n\n[元数据] {extra}"
-    return full_text, timestamps_json, srt_text, segments
-
-def generate_subtitle_html(segments, audio_path, max_size_mb=5):
-    if not audio_path or not os.path.exists(audio_path) or not segments:
-        return '<div style="padding:20px; text-align:center; color:#999;">暂无字幕预览</div>'
-    try:
-        size = os.path.getsize(audio_path) / (1024 * 1024)
-        if size > max_size_mb:
-            return (
-                '<div style="padding:20px; text-align:center; color:#666;">'
-                f'[提示] 音频文件过大 ({size:.1f} MB)，超过 {max_size_mb} MB 预览限制。</div>'
-            )
-    except:
-        pass
-    mime_map = {
-        '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
-        '.flac': 'audio/flac', '.ogg': 'audio/ogg', '.aac': 'audio/aac'
-    }
-    ext = os.path.splitext(audio_path)[1].lower()
-    mime_type = mime_map.get(ext, 'audio/wav')
-    try:
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-        b64_data = base64.b64encode(audio_data).decode('utf-8')
-    except Exception as e:
-        return f'<div style="color:red;">音频加载失败: {e}</div>'
-
-    audio_html = (
-        '<div style="margin-bottom:15px; padding:15px; background:#f8f9fa; border-radius:8px; border:1px solid #ddd;">'
-        '<div style="margin-bottom:8px; font-weight:bold; color:#333;">音频回放</div>'
-        '<audio id="preview-audio" controls style="width:100%;">'
-        f'<source src="data:{mime_type};base64,{b64_data}" type="{mime_type}">'
-        '</audio></div>'
-    )
-
-    cues_parts = [
-        '<div id="subtitle-container" style="height:500px; overflow-y:auto; border:1px solid #ccc; '
-        'padding:10px; border-radius:5px; background-color:#fff;">'
-    ]
-    for i, seg in enumerate(segments):
-        safe_text = html.escape(seg["text"])
-        cues_parts.append(
-            f'<div class="subtitle-row" data-index="{i}" data-start="{seg["start"]}" data-end="{seg["end"]}" '
-            f'style="padding:10px; margin:5px 0; border-radius:5px; border-bottom:1px solid #eee; '
-            f'cursor:pointer; display:flex; align-items:flex-start;">'
-            f'<span style="color:#666; font-size:0.85em; margin-right:15px; font-family:monospace; '
-            f'background:#eee; padding:2px 6px; border-radius:4px; min-width:60px; text-align:center;">'
-            f'{seg["start"]:.2f}s</span>'
-            f'<span class="text-content" style="font-size:1.1rem; color:#333; line-height:1.5;">{safe_text}</span>'
-            f'</div>'
-        )
-    cues_parts.append('</div>')
-    cues_html = '\n'.join(cues_parts)
-
-    js_script = """
-<script>
-(function() {
-    let audio = document.getElementById("preview-audio");
-    let container = document.getElementById("subtitle-container");
-    if (!audio || !container) return;
-    let rows = container.querySelectorAll(".subtitle-row");
-    let clickBound = false;
-    function updateHighlight() {
-        let currentTime = audio.currentTime;
-        rows.forEach(row => {
-            let start = parseFloat(row.getAttribute("data-start"));
-            let end = parseFloat(row.getAttribute("data-end"));
-            if (currentTime >= start && currentTime < end) {
-                if (!row.classList.contains("active")) {
-                    row.classList.add("active");
-                    row.style.backgroundColor = "#e3f2fd";
-                    row.style.borderLeft = "5px solid #2196f3";
-                    row.style.fontWeight = "bold";
-                    row.style.transform = "scale(1.01)";
-                    row.style.boxShadow = "0 2px 5px rgba(0,0,0,0.1)";
-                    row.scrollIntoView({ behavior: "smooth", block: "center" });
-                }
-            } else {
-                if (row.classList.contains("active")) {
-                    row.classList.remove("active");
-                    row.style.backgroundColor = "";
-                    row.style.borderLeft = "";
-                    row.style.fontWeight = "";
-                    row.style.transform = "";
-                    row.style.boxShadow = "";
-                }
-            }
-        });
-    }
-    if (!clickBound) {
-        rows.forEach(row => {
-            row.onclick = function() {
-                let start = parseFloat(row.getAttribute("data-start"));
-                audio.currentTime = start;
-                audio.play();
-            };
-        });
-        clickBound = true;
-    }
-    audio.addEventListener("timeupdate", updateHighlight);
-    setTimeout(updateHighlight, 100);
-})();
-</script>
-"""
-    return audio_html + cues_html + js_script
-
-def save_outputs(base_name, full_text, timestamps_json, srt_text, language, model_info):
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    if base_name:
-        safe = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', Path(base_name).stem)
-        prefix = f"{safe}_{timestamp}"
+# ==================== FFmpeg ====================
+def find_ffmpeg():
+    portable_dir = PROJECT_ROOT / "ffmpeg" / "bin"
+    if sys.platform == "win32":
+        exe = portable_dir / "ffmpeg.exe"
     else:
-        prefix = f"whisperx_{timestamp}"
-    saved = {}
-    txt_path = OUTPUT_DIR / f"{prefix}.txt"
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write(full_text)
-    saved['txt'] = str(txt_path)
-    if timestamps_json and timestamps_json != "{}":
-        json_path = OUTPUT_DIR / f"{prefix}.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            f.write(timestamps_json)
-        saved['json'] = str(json_path)
-    if srt_text.strip():
-        srt_path = OUTPUT_DIR / f"{prefix}.srt"
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            f.write(srt_text)
-        saved['srt'] = str(srt_path)
-    return saved
-
-def get_system_info(align_model_info: str = ""):
-    info = []
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(0) / 1e9
-        info.append(f"显卡: {gpu_name} ({total:.1f} GB)")
-        info.append(f"已分配显存: {allocated:.1f} GB")
-    else:
-        info.append("设备: CPU模式")
-    with manager.lock:
-        if manager.asr_model:
-            info.append(f"ASR模型: {manager.current_asr_model_name}")
-            info.append(f"计算类型: {manager.current_compute_type}")
-        else:
-            info.append("ASR模型: 未加载")
-    info.append(f"输出目录: {OUTPUT_DIR}")
-    info.append(f"打轴输出: {ALIGN_OUTPUT_DIR}")
-    if align_model_info:
-        info.append(f"对齐模型: {align_model_info}")
-    return "\n".join(info)
-
-def generate_output_filename(base_input, timestamp_str, custom_suffix="", default_name="recording"):
-    original_name = None
-    if isinstance(base_input, str) and os.path.exists(base_input):
-        original_name = Path(base_input).stem
-    elif isinstance(base_input, dict) and base_input.get('path') and os.path.exists(base_input['path']):
-        original_name = Path(base_input['path']).stem
-    elif isinstance(base_input, tuple):
-        original_name = default_name
-    if not original_name:
-        original_name = default_name
-    safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '', original_name)
-    if not safe_name:
-        safe_name = default_name
-    parts = [safe_name, timestamp_str]
-    if custom_suffix:
-        parts.append(custom_suffix)
-    return "_".join(parts)
+        exe = portable_dir / "ffmpeg"
+    if exe.exists():
+        return str(exe)
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    return "ffmpeg"
+FFMPEG_PATH = find_ffmpeg()
 
 # ==================== 语言到对齐模型的映射表 ====================
 LANGUAGE_ALIGN_MODEL_MAP = {
@@ -493,11 +241,13 @@ LANGUAGE_ALIGN_MODEL_MAP = {
 }
 
 def get_align_model_from_language(language: str, local_models: List[Tuple[str, str]]) -> Tuple[Optional[str], bool]:
+    """根据语言代码返回对齐模型路径或ID，并指示是否为本地模型"""
     if not language:
         return None, False
     lang = language.strip().lower()
     if lang in LANGUAGE_ALIGN_MODEL_MAP:
         online_id = LANGUAGE_ALIGN_MODEL_MAP[lang]
+        # 在本地模型中查找匹配项
         for display, path in local_models:
             if online_id.split("/")[-1].replace("-", "") in display.replace("-", "").replace("_", "").lower():
                 return path, True
@@ -505,39 +255,33 @@ def get_align_model_from_language(language: str, local_models: List[Tuple[str, s
     return None, False
 
 # ==================== 模型管理器 ====================
-class WhisperXManager:
+class AlignModelManager:
     def __init__(self):
-        self.asr_model = None
+        self.model = None
+        self.current_model_name = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "int8_float32"
         self.align_model = None
         self.align_metadata = None
-        self.current_asr_model_name = None
-        self.current_device = None
-        self.current_compute_type = None
-        self.settings = load_settings()
-        self.temp_files = []
-        self.lock = threading.RLock()
 
-    def get_available_local_models(self):
+    def get_local_models(self):
         """扫描 faster-whisper 模型"""
         models = []
-        models_dir = ROOT_DIR / "pretrained_models"
+        models_dir = PROJECT_ROOT / "pretrained_models"
         if not models_dir.exists():
             return []
         for item in models_dir.iterdir():
             if item.is_dir() and "faster-whisper" in item.name.lower():
-                if (item / "model.bin").exists() or (item / "config.json").exists() or (item / "pytorch_model.bin").exists():
+                if (item / "model.bin").exists() or (item / "config.json").exists():
                     match = re.search(r'faster-whisper-(\w+(?:-\w+)?)', item.name.lower())
-                    if match:
-                        display_name = match.group(1)
-                    else:
-                        display_name = item.name
-                    models.append((display_name, str(item)))
+                    display = match.group(1) if match else item.name
+                    models.append((display, str(item)))
         return models
 
     def get_local_align_models(self):
         """扫描本地 wav2vec2 对齐模型"""
         models = []
-        models_dir = ROOT_DIR / "pretrained_models"
+        models_dir = PROJECT_ROOT / "pretrained_models"
         if not models_dir.exists():
             return []
         for item in models_dir.iterdir():
@@ -549,67 +293,66 @@ class WhisperXManager:
                     models.append((item.name, str(item)))
         return models
 
-    def load_asr_model(self, model_size, device, compute_type, language=None):
-        with self.lock:
-            if (self.asr_model is not None and
-                self.current_asr_model_name == model_size and
-                self.current_device == device and
-                self.current_compute_type == compute_type):
-                return True, f"ASR模型已加载: {model_size}"
+    def load_model(self, model_size, device, compute_type):
+        if self.model is not None and self.current_model_name == model_size:
+            return True, f"模型 {model_size} 已加载"
+        local_models = self.get_local_models()
+        model_path = None
+        for disp, path in local_models:
+            if disp == model_size:
+                model_path = path
+                break
+        if model_path:
+            model_name_or_path = model_path
+            local_only = True
+        else:
+            model_name_or_path = model_size
+            local_only = False
+        try:
+            self.model = WhisperModel(
+                model_name_or_path,
+                device=device,
+                compute_type=compute_type,
+                local_files_only=local_only
+            )
+            self.current_model_name = model_size
+            self.device = device
+            self.compute_type = compute_type
+            return True, f"模型 {model_size} 加载成功"
+        except Exception as e:
+            return False, f"加载失败: {e}"
 
-            local_models = self.get_available_local_models()
-            local_path = None
-            for display_name, path in local_models:
-                if display_name == model_size:
-                    local_path = path
-                    break
-
-            if local_path and os.path.exists(local_path):
-                model_name_or_path = local_path
-                local_files_only = True
-                print(f"使用本地模型: {model_name_or_path}")
-            else:
-                std_local_path = ROOT_DIR / "pretrained_models" / model_size
-                if std_local_path.exists() and (std_local_path / "model.bin").exists():
-                    model_name_or_path = str(std_local_path)
-                    local_files_only = True
-                    print(f"使用本地模型: {model_name_or_path}")
-                else:
-                    model_name_or_path = model_size
-                    local_files_only = False
-                    print(f"将从 HuggingFace 下载模型: {model_name_or_path}")
-
-            self.unload_models()
-            try:
-                self.asr_model = WhisperModel(
-                    model_name_or_path,
-                    device=device,
-                    compute_type=compute_type,
-                    local_files_only=local_files_only
-                )
-                self.current_asr_model_name = model_name_or_path
-                self.current_device = device
-                self.current_compute_type = compute_type
-                return True, f"ASR模型加载成功: {model_size}"
-            except Exception as e:
-                logging.error(traceback.format_exc())
-                return False, f"加载ASR模型失败: {str(e)}"
-
-    def unload_models(self):
-        with self.lock:
-            if self.asr_model:
-                del self.asr_model
-                self.asr_model = None
-            self.unload_align_model()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    def transcribe_with_segments(self, audio_path, language=None, beam_size=5, vad_filter=True, initial_prompt=None):
+        """转写并返回完整的segments信息，支持热词"""
+        if self.model is None:
+            return None, "模型未加载"
+        try:
+            segments, info = self.model.transcribe(
+                audio_path, language=language, beam_size=beam_size,
+                vad_filter=vad_filter, word_timestamps=True,
+                initial_prompt=initial_prompt
+            )
+            seg_list = []
+            for seg in segments:
+                seg_dict = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+                if seg.words:
+                    seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
+                seg_list.append(seg_dict)
+            return {"language": info.language, "segments": seg_list}, None
+        except Exception as e:
+            return None, str(e)
 
     def load_align_model(self, language_code: str, device: str, model_name: str = None, model_dir: str = None):
         """加载 wav2vec2 对齐模型"""
         if not WHISPERX_ALIGN_AVAILABLE:
             raise RuntimeError("whisperx.align 模块不可用")
-        self.unload_align_model()
+        if self.align_model is not None:
+            del self.align_model
+            self.align_model = None
+            self.align_metadata = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         self.align_model, self.align_metadata = load_align_model(
             language_code=language_code,
             device=device,
@@ -627,292 +370,45 @@ class WhisperXManager:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def transcribe(self, audio_path, language=None, beam_size=5, vad_filter=True, word_timestamps=True, initial_prompt=None):
-        with self.lock:
-            if self.asr_model is None:
-                return None, "ASR模型未加载"
-        try:
-            segments, info = self.asr_model.transcribe(
-                audio_path, language=language, beam_size=beam_size,
-                vad_filter=vad_filter, word_timestamps=word_timestamps,
-                initial_prompt=initial_prompt
-            )
-            sentences = []
-            all_words = []
-            for seg in segments:
-                sentence = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-                if seg.words:
-                    words = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
-                    sentence["words"] = words
-                    all_words.extend(words)
-                sentences.append(sentence)
-            result = {
-                "language": info.language,
-                "language_probability": info.language_probability,
-                "segments": sentences,
-                "words": all_words
-            }
-            return result, None
-        except Exception as e:
-            return None, str(e)
+manager = AlignModelManager()
 
-    def transcribe_with_segments(self, audio_path, language=None, beam_size=5, vad_filter=True, initial_prompt=None):
-        with self.lock:
-            if self.asr_model is None:
-                return None, "ASR模型未加载"
-        try:
-            segments, info = self.asr_model.transcribe(
-                audio_path, language=language, beam_size=beam_size,
-                vad_filter=vad_filter, word_timestamps=True,
-                initial_prompt=initial_prompt
-            )
-            seg_list = []
-            for seg in segments:
-                seg_dict = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-                if seg.words:
-                    seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
-                seg_list.append(seg_dict)
-            return {"language": info.language, "segments": seg_list}, None
-        except Exception as e:
-            return None, str(e)
+def get_system_status(align_model_info: str = ""):
+    """生成状态信息字符串"""
+    lines = []
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        lines.append(f"显卡: {gpu_name} ({total_mem:.1f} GB)")
+    else:
+        lines.append("设备: CPU 模式")
+    lines.append(f"ASR模型: {manager.current_model_name or '未加载'}")
+    lines.append(f"计算类型: {manager.compute_type}")
+    lines.append(f"FFmpeg: {'已找到' if FFMPEG_PATH != 'ffmpeg' else '未找到'}")
+    if align_model_info:
+        lines.append(f"对齐模型: {align_model_info}")
+    return "\n".join(lines)
 
-    def cleanup_temp(self):
-        cleaned = 0
-        for f in self.temp_files[:]:
-            try:
-                os.unlink(f)
-                self.temp_files.remove(f)
-                cleaned += 1
-            except:
-                pass
-        return cleaned
-
-    def _prepare_audio(self, audio_input):
-        try:
-            if isinstance(audio_input, str) and os.path.exists(audio_input):
-                return audio_input
-            if isinstance(audio_input, tuple) and len(audio_input) == 2:
-                sr, data = audio_input
-                if data is None:
-                    return None
-                if data.ndim > 1:
-                    data = np.mean(data, axis=1)
-                if np.issubdtype(data.dtype, np.integer):
-                    data = data.astype(np.float32)
-                    max_val = np.abs(data).max()
-                    if max_val > 0:
-                        data = data / max_val
-                else:
-                    data = data.astype(np.float32)
-                    data = np.clip(data, -1.0, 1.0)
-                if np.any(np.isnan(data)) or np.any(np.isinf(data)):
-                    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-                if sr != 16000:
-                    data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-                    sr = 16000
-                data = np.clip(data, -1.0, 1.0)
-                temp_hash = hashlib.md5(data.tobytes() + str(time.time()).encode()).hexdigest()[:8]
-                temp_path = os.path.join(tempfile.gettempdir(), f"whisperx_temp_{temp_hash}.wav")
-                sf.write(temp_path, data, sr)
-                self.temp_files.append(temp_path)
-                return temp_path
-            return None
-        except Exception as e:
-            print(f"音频转换失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-manager = WhisperXManager()
-
-# ==================== WebUI 核心函数 ====================
-def ensure_model_loaded(model_size, device, compute_type, language, progress=None):
-    success, msg = manager.load_asr_model(model_size, device, compute_type, language)
-    if not success:
-        raise RuntimeError(msg)
-    return manager
-
-def transcribe_audio(audio, model_size, device, compute_type, language, beam_size, vad_filter,
-                     hotwords, progress=gr.Progress()):
-    if audio is None:
-        return "请上传或录制音频", "", "", ""
-    progress(0, desc="初始化...")
-    try:
-        ensure_model_loaded(model_size, device, compute_type, language, progress)
-    except RuntimeError as e:
-        return str(e), "", "", ""
-    progress(0.3, desc="转写中...")
-    audio_path = manager._prepare_audio(audio)
-    if audio_path is None:
-        return "音频处理失败", "", "", ""
-    try:
-        result, error = manager.transcribe(
-            audio_path, language=language, beam_size=beam_size,
-            vad_filter=vad_filter, word_timestamps=True,
-            initial_prompt=hotwords if hotwords.strip() else None
-        )
-        if error:
-            return f"错误: {error}", "", "", ""
-        progress(0.7, desc="生成输出...")
-        full_text, timestamps_json, srt_text, segments = format_result_to_outputs(result)
-        base_name = None
-        if isinstance(audio, str) and os.path.exists(audio):
-            base_name = audio
-        saved = save_outputs(
-            base_name, full_text, timestamps_json, srt_text,
-            language=result.get("language", "未知"), model_info=model_size
-        )
-        preview_max_size = manager.settings.get("preview_max_size_mb", 5)
-        subtitle_html = generate_subtitle_html(segments, audio_path, preview_max_size)
-        save_info = "文件已保存:\n"
-        if saved.get('txt'):
-            save_info += f" {Path(saved['txt']).name}\n"
-        if saved.get('json'):
-            save_info += f" {Path(saved['json']).name}\n"
-        if saved.get('srt'):
-            save_info += f" {Path(saved['srt']).name}\n"
-        full_text = save_info + "\n" + full_text
-        progress(1.0, desc="完成")
-        return full_text, timestamps_json, srt_text, subtitle_html
-    finally:
-        manager.cleanup_temp()
-
-def transcribe_video(video, model_size, device, compute_type, language, beam_size, vad_filter,
-                     subtitle_mode, hotwords, progress=gr.Progress()):
-    temp_audio_path = None
-    try:
-        if video is None:
-            return "请上传视频文件", "", ""
-        progress(0, desc="初始化...")
-        ensure_model_loaded(model_size, device, compute_type, language, progress)
-        progress(0.2, desc="提取视频音频...")
-        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_audio.close()
-        audio_path = temp_audio.name
-        temp_audio_path = audio_path
-        cmd = [FFMPEG_PATH, "-i", video, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", audio_path]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        progress(0.4, desc="转写音频...")
-        result, error = manager.transcribe(
-            audio_path, language=language, beam_size=beam_size,
-            vad_filter=vad_filter, word_timestamps=True,
-            initial_prompt=hotwords if hotwords.strip() else None
-        )
-        if error:
-            return f"识别失败: {error}", "", ""
-        progress(0.6, desc="生成字幕...")
-        full_text, timestamps_json, srt_text, segments = format_result_to_outputs(result)
-        base_name = video if isinstance(video, str) and os.path.exists(video) else None
-        saved = save_outputs(
-            base_name, full_text, timestamps_json, srt_text,
-            language=result.get("language", "未知"), model_info=model_size
-        )
-        save_info = "文件已保存:\n"
-        if saved.get('txt'):
-            save_info += f" {Path(saved['txt']).name}\n"
-        if saved.get('json'):
-            save_info += f" {Path(saved['json']).name}\n"
-        if saved.get('srt'):
-            save_info += f" {Path(saved['srt']).name}\n"
-        srt_path = saved.get('srt')
-        if not srt_path:
-            result_msg = f"处理完成，但未生成字幕（可能音频无语音）。\n{save_info}"
-            return result_msg, "", ""
-        progress(0.8, desc="嵌入字幕...")
-        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-        prefix = generate_output_filename(video, timestamp_str, subtitle_mode, default_name="video")
-        out_path = OUTPUT_DIR / f"{prefix}.mp4"
-        srt_path_str = str(srt_path).replace('\\', '/')
-        video_path_str = str(video).replace('\\', '/')
-        out_path_str = str(out_path).replace('\\', '/')
-        if subtitle_mode == "soft":
-            cmd = [FFMPEG_PATH, "-i", video_path_str, "-i", srt_path_str,
-                   "-c", "copy", "-c:s", "mov_text",
-                   "-metadata:s:s:0", "language=chi", "-y", out_path_str]
-        else:
-            safe_srt = srt_path_str.replace("'", "'\\''")
-            vf = f"subtitles='{safe_srt}':force_style='FontName=Microsoft YaHei,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'"
-            cmd = [FFMPEG_PATH, "-i", video_path_str,
-                   "-vf", vf,
-                   "-c:a", "copy", "-y", out_path_str]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        result_msg = f"处理完成！\n输出视频: {out_path.name}\n{save_info}"
-        combined_text = f"{result_msg}\n\n[识别文本]\n{full_text}"
-        progress(1.0, desc="完成")
-        return combined_text, timestamps_json, srt_text
-    except Exception as e:
-        logging.error(traceback.format_exc())
-        return f"处理视频失败: {str(e)}", "", ""
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            try:
-                os.unlink(temp_audio_path)
-            except:
-                pass
-        manager.cleanup_temp()
-
-def transcribe_batch(files, model_size, device, compute_type, language, beam_size, vad_filter,
-                     hotwords, progress=gr.Progress()):
-    if not files:
-        return "请选择音频文件", "", ""
-    try:
-        ensure_model_loaded(model_size, device, compute_type, language, progress)
-    except RuntimeError as e:
-        return str(e), "", ""
-    results_text = []
-    total = len(files)
-    for i, file_obj in enumerate(files, 1):
-        file_path = file_obj.name if hasattr(file_obj, 'name') else str(file_obj)
-        progress(i / total, desc=f"处理 {i}/{total}: {os.path.basename(file_path)}")
-        audio_path = manager._prepare_audio(file_path)
-        if audio_path is None:
-            results_text.append(f"[{os.path.basename(file_path)}]\n错误: 音频处理失败\n")
-            continue
-        try:
-            result, error = manager.transcribe(
-                audio_path, language=language, beam_size=beam_size,
-                vad_filter=vad_filter, word_timestamps=True,
-                initial_prompt=hotwords if hotwords.strip() else None
-            )
-            if error:
-                results_text.append(f"[{os.path.basename(file_path)}]\n错误: {error}\n")
-            else:
-                full_text, timestamps_json, srt_text, _ = format_result_to_outputs(result)
-                saved = save_outputs(
-                    file_path, full_text, timestamps_json, srt_text,
-                    language=result.get("language", "未知"), model_info=model_size
-                )
-                saved_files = []
-                if saved.get('txt'):
-                    saved_files.append(f"{Path(saved['txt']).name}")
-                if saved.get('json'):
-                    saved_files.append(f"{Path(saved['json']).name}")
-                if saved.get('srt'):
-                    saved_files.append(f"{Path(saved['srt']).name}")
-                file_list = "\n ".join(saved_files) if saved_files else "无文件保存"
-                results_text.append(f"[{os.path.basename(file_path)}]\n已保存:\n {file_list}\n")
-        finally:
-            manager.cleanup_temp()
-    return "\n".join(results_text), "", ""
-
-def force_align_wrapper(
-    audio, reference_text, model_size, device, compute_type, language, beam_size, vad_filter,
-    align_granularity, hotwords,
-    align_model_choice, auto_match_align,  # 新增对齐模型参数
+# ==================== UI 处理函数 ====================
+def run_alignment(
+    audio_file, text_content,
+    model_size, device, compute_type, language, beam_size, vad_filter,
+    hotwords,  # 新增热词参数
+    align_model_choice, auto_match_align,
+    align_granularity,
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
     progress=gr.Progress()
 ):
-    if audio is None:
-        return "请上传音频文件", "", "", get_system_info()
-    if not reference_text.strip():
-        return "请粘贴稿子文本", "", "", get_system_info()
+    if audio_file is None:
+        return "错误: 请上传音频文件", "", "", "", get_system_status()
+    if not text_content or not text_content.strip():
+        return "错误: 请粘贴稿子文本", "", "", "", get_system_status()
 
     # ---- 1. 确定对齐模型 ----
     local_align_models = manager.get_local_align_models()
     align_model_path = None
-    align_model_display = "默认（简单算法）"
+    align_model_display = ""
     use_whisperx_align = False
 
     if auto_match_align and language:
@@ -938,662 +434,405 @@ def force_align_wrapper(
                 align_model_display = f"{align_model_choice} (在线)"
                 use_whisperx_align = WHISPERX_ALIGN_AVAILABLE
         else:
+            align_model_display = "默认（由WhisperX自动选择）"
             use_whisperx_align = WHISPERX_ALIGN_AVAILABLE
             align_model_path = None
-            align_model_display = "默认（WhisperX自动选择）" if use_whisperx_align else "默认（简单算法）"
 
-    status_text = get_system_info(align_model_display)
+    status_text = get_system_status(align_model_display)
 
     # ---- 2. 加载ASR模型并转写 ----
     progress(0.1, desc="加载ASR模型...")
-    try:
-        ensure_model_loaded(model_size, device, compute_type, language, progress)
-    except RuntimeError as e:
-        return str(e), "", "", status_text
+    success, msg = manager.load_model(model_size, device, compute_type)
+    if not success:
+        return f"错误: {msg}", "", "", "", status_text
 
     progress(0.3, desc="转写音频...")
-    audio_path = manager._prepare_audio(audio)
-    if not audio_path:
-        return "音频处理失败", "", "", status_text
+    audio_path = audio_file
+    # 传递热词参数
+    initial_prompt = hotwords if hotwords and hotwords.strip() else None
+    result, err = manager.transcribe_with_segments(
+        audio_path, language, beam_size, vad_filter,
+        initial_prompt=initial_prompt
+    )
+    if err:
+        return f"错误: 转写失败 - {err}", "", "", "", status_text
 
-    try:
-        result, err = manager.transcribe_with_segments(
-            audio_path, language, beam_size, vad_filter,
-            initial_prompt=hotwords if hotwords.strip() else None
-        )
-        if err:
-            return f"转写失败: {err}", "", "", status_text
-
-        # ---- 3. 精细对齐（如果可用） ----
-        if use_whisperx_align:
-            progress(0.6, desc=f"加载对齐模型: {align_model_display}...")
-            try:
-                model_name_for_align = align_model_path
-                model_dir_for_align = str(ROOT_DIR / "pretrained_models")
-                if align_model_choice == "无（使用默认）" and auto_match_align == False:
-                    model_name_for_align = None
-
-                align_model, align_metadata = manager.load_align_model(
-                    language_code=language or result.get("language", "en"),
-                    device=device,
-                    model_name=model_name_for_align,
-                    model_dir=model_dir_for_align
-                )
-                progress(0.7, desc="执行精细对齐...")
-                aligned_result = align(
-                    transcript=result["segments"],
-                    model=align_model,
-                    align_model_metadata=align_metadata,
-                    audio=audio_path,
-                    device=device,
-                    return_char_alignments=(align_granularity == "char")
-                )
-                result = aligned_result
-                manager.unload_align_model()
-            except Exception as e:
-                progress(0.7, desc="对齐失败，回退到简单算法")
-                print(f"警告: whisperx.align 执行失败，将使用简单对齐算法。错误: {e}")
-                manager.unload_align_model()
-                use_whisperx_align = False
-
-        # ---- 4. 提取单词时间戳 ----
-        words = []
-        if use_whisperx_align:
-            for seg in result.get("segments", []):
-                if "words" in seg and seg["words"]:
-                    words.extend(seg["words"])
-                elif "char-segments" in seg and align_granularity == "char":
-                    for char_seg in seg["char-segments"]:
-                        words.append({"word": char_seg["char"], "start": char_seg["start"], "end": char_seg["end"]})
-        else:
-            for seg in result.get("segments", []):
-                if "words" in seg and seg["words"]:
-                    words.extend(seg["words"])
-
-        if not words:
-            return "未能获得单词时间戳", "", "", status_text
-
-        # ---- 5. 文稿匹配 ----
-        progress(0.8, desc="匹配文稿...")
+    # ---- 3. 精细对齐（如果可用） ----
+    if use_whisperx_align:
+        progress(0.6, desc=f"加载对齐模型: {align_model_display}...")
         try:
-            data, sr = sf.read(audio_path)
-            duration = len(data) / sr
-        except:
-            duration = None
+            model_name_for_align = align_model_path
+            model_dir_for_align = str(PROJECT_ROOT / "pretrained_models")
+            if align_model_choice == "无（使用默认）" and auto_match_align == False:
+                model_name_for_align = None
 
-        if align_granularity == "char":
-            aligned = force_align_char_level(reference_text, words, duration)
-        else:
-            aligned = force_align_word_level(reference_text, words, duration)
+            align_model, align_metadata = manager.load_align_model(
+                language_code=language or result.get("language", "en"),
+                device=device,
+                model_name=model_name_for_align,
+                model_dir=model_dir_for_align
+            )
+            progress(0.7, desc="执行精细对齐...")
+            aligned_result = align(
+                transcript=result["segments"],
+                model=align_model,
+                align_model_metadata=align_metadata,
+                audio=audio_path,
+                device=device,
+                return_char_alignments=(align_granularity == "char")
+            )
+            result = aligned_result
+            manager.unload_align_model()
+        except Exception as e:
+            progress(0.7, desc="对齐失败，回退到简单算法")
+            print(f"警告: whisperx.align 执行失败，将使用简单对齐算法。错误: {e}")
+            manager.unload_align_model()
+            use_whisperx_align = False
 
-        if not aligned:
-            return "对齐失败，请检查稿子与音频是否匹配", "", "", status_text
+    # ---- 4. 提取单词时间戳（增强版：补全缺失时间戳的单词） ----
+    words = []
+    if use_whisperx_align:
+        # 对齐成功，使用精细对齐结果
+        for seg in result.get("segments", []):
+            if "words" in seg and seg["words"]:
+                seg_words = seg["words"]
+                for i, w in enumerate(seg_words):
+                    if "start" in w and "end" in w and "word" in w:
+                        words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
+                    else:
+                        # 尝试为缺失时间的单词估算时间
+                        prev_word = seg_words[i-1] if i > 0 else None
+                        next_word = seg_words[i+1] if i < len(seg_words)-1 else None
+                        if prev_word and "end" in prev_word:
+                            start = prev_word["end"]
+                        else:
+                            start = seg["start"] if "start" in seg else 0.0
+                        if next_word and "start" in next_word:
+                            end = next_word["start"]
+                        else:
+                            end = seg["end"] if "end" in seg else start + 0.01
+                        word_text = w.get("word", w.get("char", ""))
+                        if word_text:
+                            words.append({"word": word_text, "start": start, "end": end})
+            elif "char-segments" in seg and align_granularity == "char":
+                for char_seg in seg["char-segments"]:
+                    if "char" in char_seg and "start" in char_seg and "end" in char_seg:
+                        words.append({"word": char_seg["char"], "start": char_seg["start"], "end": char_seg["end"]})
+    else:
+        # 回退：使用 faster-whisper 自带单词时间戳
+        for seg in result.get("segments", []):
+            if "words" in seg and seg["words"]:
+                seg_words = seg["words"]
+                for i, w in enumerate(seg_words):
+                    if "start" in w and "end" in w and "word" in w:
+                        words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
+                    else:
+                        prev_word = seg_words[i-1] if i > 0 else None
+                        next_word = seg_words[i+1] if i < len(seg_words)-1 else None
+                        start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
+                        end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start+0.01)
+                        word_text = w.get("word", "")
+                        if word_text:
+                            words.append({"word": word_text, "start": start, "end": end})
 
-        # ---- 6. 生成字幕 ----
-        word_srt = words_to_srt(aligned)
-        paragraphs = re.split(r'\n\s*\n', reference_text.strip())
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-        char_pos = 0
-        sentences = []
-        if align_granularity == "char":
-            for para in paragraphs:
-                para_char_count = len([ch for ch in para if not ch.isspace()])
-                start_idx = char_pos
-                end_idx = char_pos + para_char_count
-                if start_idx >= len(aligned):
-                    break
-                if end_idx > len(aligned):
-                    end_idx = len(aligned)
-                seg_words = aligned[start_idx:end_idx]
-                if seg_words:
-                    sentences.append({
-                        "start": seg_words[0]["start"],
-                        "end": seg_words[-1]["end"],
-                        "text": "".join([w["word"] for w in seg_words])
-                    })
-                char_pos = end_idx
-        else:
-            word_idx = 0
-            for para in paragraphs:
-                para_words = para.split()
-                para_word_count = len(para_words)
-                start_idx = word_idx
-                end_idx = word_idx + para_word_count
-                if start_idx >= len(aligned):
-                    break
-                if end_idx > len(aligned):
-                    end_idx = len(aligned)
-                seg_words = aligned[start_idx:end_idx]
-                if seg_words:
-                    sentences.append({
-                        "start": seg_words[0]["start"],
-                        "end": seg_words[-1]["end"],
-                        "text": " ".join([w["word"] for w in seg_words])
-                    })
-                word_idx = end_idx
+    if not words:
+        return "错误: 未检测到有效的单词时间戳", "", "", "", status_text
 
-        sent_srt = sentences_to_srt(sentences)
-        merged_srt = _generate_merged_srt(
-            aligned, sentences, paragraphs,
-            merge_punctuations, merge_max_words, merge_max_chars,
-            merge_max_duration, merge_by_newline,
-            merge_by_punc, merge_by_silence, merge_by_wordcount,
-            merge_by_charcount, merge_by_duration, merge_silence_threshold
-        )
+    # ---- 5. 文稿匹配 ----
+    progress(0.8, desc="匹配文稿...")
+    try:
+        data, sr = sf.read(audio_path)
+        duration = len(data) / sr
+    except:
+        duration = None
 
-        # ---- 7. 保存文件 ----
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        prefix = f"align_{timestamp}"
-        word_path = ALIGN_OUTPUT_DIR / f"{prefix}_words.srt"
-        sent_path = ALIGN_OUTPUT_DIR / f"{prefix}_sentences.srt"
-        merged_path = ALIGN_OUTPUT_DIR / f"{prefix}_merged.srt"
-        with open(word_path, "w", encoding="utf-8") as f:
-            f.write(word_srt)
-        with open(sent_path, "w", encoding="utf-8") as f:
-            f.write(sent_srt)
-        with open(merged_path, "w", encoding="utf-8") as f:
-            f.write(merged_srt)
+    if align_granularity == "char":
+        aligned = force_align_char_level(text_content, words, duration)
+    else:
+        aligned = force_align_word_level(text_content, words, duration)
 
-        progress(1.0, desc="完成")
-        return word_srt, sent_srt, merged_srt, status_text
-    finally:
-        manager.cleanup_temp()
+    if not aligned:
+        return "错误: 对齐失败，请检查稿子与音频是否匹配", "", "", "", status_text
 
-def load_model_click(model_size, device, compute_type, language):
-    success, msg = manager.load_asr_model(model_size, device, compute_type, language)
-    return msg, get_system_info()
+    # ---- 6. 生成字幕 ----
+    word_srt = words_to_srt(aligned)
 
-def unload_model_click():
-    manager.unload_models()
-    return "模型已卸载", get_system_info()
+    paragraphs = re.split(r'\n\s*\n', text_content.strip())
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    char_pos = 0
+    sentences = []
+    if align_granularity == "char":
+        for para in paragraphs:
+            para_char_count = len([ch for ch in para if not ch.isspace()])
+            start_idx = char_pos
+            end_idx = char_pos + para_char_count
+            if start_idx >= len(aligned):
+                break
+            if end_idx > len(aligned):
+                end_idx = len(aligned)
+            seg_words = aligned[start_idx:end_idx]
+            if seg_words:
+                sentences.append({
+                    "start": seg_words[0]["start"],
+                    "end": seg_words[-1]["end"],
+                    "text": "".join([w["word"] for w in seg_words])
+                })
+            char_pos = end_idx
+    else:
+        word_idx = 0
+        for para in paragraphs:
+            para_words = para.split()
+            para_word_count = len(para_words)
+            start_idx = word_idx
+            end_idx = word_idx + para_word_count
+            if start_idx >= len(aligned):
+                break
+            if end_idx > len(aligned):
+                end_idx = len(aligned)
+            seg_words = aligned[start_idx:end_idx]
+            if seg_words:
+                sentences.append({
+                    "start": seg_words[0]["start"],
+                    "end": seg_words[-1]["end"],
+                    "text": " ".join([w["word"] for w in seg_words])
+                })
+            word_idx = end_idx
 
-def refresh_status():
-    return get_system_info()
+    sent_srt = sentences_to_srt(sentences)
+    merged_srt = generate_merged_srt(
+        aligned, sentences, paragraphs,
+        merge_punctuations, merge_max_words, merge_max_chars,
+        merge_max_duration, merge_by_newline,
+        merge_by_punc, merge_by_silence, merge_by_wordcount,
+        merge_by_charcount, merge_by_duration, merge_silence_threshold
+    )
 
-def health_check():
-    info = get_system_info()
-    with manager.lock:
-        if manager.asr_model is None:
-            info += "\n\n[警告] ASR模型未加载，请先加载模型。"
-        else:
-            info += "\n\n[信息] 系统已就绪。"
-    return info
+    # ---- 7. 保存文件 ----
+    output_dir = PROJECT_ROOT / "output" / "字幕自动打轴"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base_name = Path(audio_path).stem
+    prefix = f"{base_name}_align_{timestamp}"
+    word_path = output_dir / f"{prefix}_words.srt"
+    sent_path = output_dir / f"{prefix}_sentences.srt"
+    merged_path = output_dir / f"{prefix}_merged.srt"
+    with open(word_path, "w", encoding="utf-8") as f:
+        f.write(word_srt)
+    with open(sent_path, "w", encoding="utf-8") as f:
+        f.write(sent_srt)
+    with open(merged_path, "w", encoding="utf-8") as f:
+        f.write(merged_srt)
+
+    status = (f"对齐完成！\n"
+              f"逐词字幕: {word_path.name}\n"
+              f"整句子幕: {sent_path.name}\n"
+              f"合并字幕: {merged_path.name}\n"
+              f"对齐模型: {align_model_display}")
+
+    return status, word_srt, sent_srt, merged_srt, status_text
+
+def clear_outputs():
+    return "", "", "", "", get_system_status()
 
 def refresh_align_model_list():
     models = manager.get_local_align_models()
     choices = ["无（使用默认）"] + [disp for disp, _ in models]
     return gr.update(choices=choices, value="无（使用默认）")
 
-# ==================== 创建 Gradio 界面 ====================
-def create_interface():
-    settings = manager.settings
-    default_output_dir = settings.get("output_dir", str(DEFAULT_OUTPUT_DIR))
-
-    global OUTPUT_DIR, ALIGN_OUTPUT_DIR
-    with config_lock:
-        OUTPUT_DIR = Path(default_output_dir)
-        ALIGN_OUTPUT_DIR = OUTPUT_DIR / "字幕自动打轴"
-        ALIGN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    local_models_with_path = manager.get_available_local_models()
-    local_display_names = [name for name, path in local_models_with_path]
-    default_models = ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"]
-    model_choices = local_display_names + [m for m in default_models if m not in local_display_names]
+# ==================== 创建界面 ====================
+def create_ui():
+    local_models = manager.get_local_models()
+    local_names = [name for name, _ in local_models]
+    default_models = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+    model_choices = local_names + [m for m in default_models if m not in local_names]
     if not model_choices:
         model_choices = default_models
 
     local_align_models = manager.get_local_align_models()
     align_choices = ["无（使用默认）"] + [disp for disp, _ in local_align_models]
 
-    device_choices = ["cuda" if torch.cuda.is_available() else "cpu", "cpu"]
-    compute_type_choices = ["int8_float32", "float16", "float32"]
+    with gr.Blocks(title="字幕自动打轴独立版", theme=gr.themes.Default()) as demo:
+        gr.Markdown("# 🎬 字幕自动打轴（文稿生字幕）")
 
-    with gr.Blocks(title="WhisperX WebUI 全功能版", theme=gr.themes.Default()) as demo:
-        gr.Markdown(
-            "# WhisperX 语音识别与字幕自动打轴系统\n"
-            "支持多语种、单词级时间戳、视频字幕嵌入、强制对齐（WhisperX精细对齐+回退算法）\n"
-            f"输出目录: `{OUTPUT_DIR}`\n"
-            f"字幕自动打轴输出: `{ALIGN_OUTPUT_DIR}`"
+        with gr.Row():
+            # ========== 左侧列 ==========
+            with gr.Column(scale=1):
+                audio_input = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"])
+                text_input = gr.Textbox(
+                    label="稿子文本",
+                    lines=10,
+                    placeholder="将稿子粘贴到这里...\n段落之间请用空行分隔。",
+                    info="支持中英文混合，段落之间请留空行"
+                )
+
+                with gr.Group():
+                    gr.Markdown("### ⚙️ 模型与识别参数")
+                    model_dropdown = gr.Dropdown(
+                        label="ASR模型", choices=model_choices,
+                        value=model_choices[0] if model_choices else "medium"
+                    )
+                    with gr.Row():
+                        device_dropdown = gr.Dropdown(
+                            label="设备", choices=["cuda", "cpu"],
+                            value="cuda" if torch.cuda.is_available() else "cpu"
+                        )
+                        compute_dropdown = gr.Dropdown(
+                            label="计算类型", choices=["int8_float32", "float16", "float32"],
+                            value="int8_float32"
+                        )
+                    with gr.Row():
+                        language_box = gr.Textbox(label="语言代码", value="zh", placeholder="留空自动检测")
+                        beam_slider = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)
+                    vad_check = gr.Checkbox(label="启用 VAD 过滤", value=True)
+
+                    # 新增：热词/提示词输入框
+                    hotwords_box = gr.Textbox(
+                        label="热词/提示词 (initial_prompt)",
+                        placeholder="例如：以下是关于人工智能的讨论，重点关注术语：Transformer、扩散模型",
+                        lines=2,
+                        value=""
+                    )
+
+                    gr.Markdown("### 🌐 多语种对齐模型")
+                    with gr.Row():
+                        align_model_dropdown = gr.Dropdown(
+                            label="对齐模型", choices=align_choices, value="无（使用默认）",
+                            interactive=True
+                        )
+                        refresh_align_btn = gr.Button("刷新列表", size="sm")
+                    auto_match_check = gr.Checkbox(
+                        label="根据语言代码自动匹配（推荐）", value=True,
+                        info="勾选后将根据左侧语言代码自动选择最合适的对齐模型"
+                    )
+
+                # 注意事项
+                gr.Markdown("""
+                <div style="margin-top: 20px; padding: 12px; background: rgba(255,255,255,0.05); border-radius: 8px; border-left: 4px solid #ff9800; font-size: 0.9em;">
+                <strong>注意事项：</strong><br>
+                • 本工具仅用于个人学习与视频剪辑使用<br>
+                • 禁止用于商业用途及侵权行为<br>
+                • 使用前确保模型与依赖环境正常配置
+                </div>
+                """)
+
+            # ========== 右侧列 ==========
+            with gr.Column(scale=2):
+                status_box = gr.Textbox(
+                    label="系统状态",
+                    value=get_system_status(),
+                    lines=5,
+                    interactive=False,
+                    show_copy_button=True
+                )
+
+                gr.Markdown("### 对齐与合并参数")
+                with gr.Group():
+                    granularity_radio = gr.Radio(
+                        label="对齐粒度", choices=[("字符级（中文）", "char"), ("单词级（英文）", "word")],
+                        value="char"
+                    )
+                    gr.Markdown("**合并规则**")
+                    with gr.Row():
+                        merge_newline = gr.Checkbox(label="按空行分段（推荐）", value=True)
+                        merge_punc = gr.Checkbox(label="按标点断句", value=True)
+                        merge_silence = gr.Checkbox(label="按静音断句", value=True)
+                    with gr.Row():
+                        merge_wordcount = gr.Checkbox(label="按词数断句", value=True)
+                        merge_charcount = gr.Checkbox(label="按字符数断句", value=True)
+                        merge_duration = gr.Checkbox(label="按时长断句", value=True)
+                    with gr.Row():
+                        punc_box = gr.Textbox(label="句末标点", value="。！？.!?", scale=2)
+                        silence_slider = gr.Slider(label="静音阈值 (秒)", minimum=0.1, maximum=1.0, value=0.3, step=0.05, scale=1)
+                    with gr.Row():
+                        max_words_slider = gr.Slider(label="最大词数", minimum=5, maximum=50, value=20, step=1)
+                        max_chars_slider = gr.Slider(label="最大字符数", minimum=5, maximum=100, value=30, step=5)
+                        max_duration_slider = gr.Slider(label="最大时长 (秒)", minimum=1.0, maximum=20.0, value=10.0, step=0.5)
+
+                with gr.Row():
+                    run_btn = gr.Button("开始对齐", variant="primary", size="lg")
+                    clear_btn = gr.Button("清空", variant="secondary")
+
+                with gr.Tabs():
+                    with gr.Tab("逐词/逐字 SRT"):
+                        word_output = gr.Textbox(label="逐词字幕", lines=20, show_copy_button=True)
+                    with gr.Tab("整句 SRT（按空行）"):
+                        sent_output = gr.Textbox(label="整句子幕", lines=20, show_copy_button=True)
+                    with gr.Tab("合并字幕"):
+                        merged_output = gr.Textbox(label="合并后的字幕", lines=20, show_copy_button=True)
+
+                gr.Markdown("""
+                ---
+                **使用提示**  
+                - 音频文件格式支持 wav/mp3/m4a/flac 等  
+                - 稿子文本中的空行将作为字幕分段依据（勾选“按空行分段”时）  
+                - 生成的字幕文件保存在 `output/字幕自动打轴` 目录下
+                """)
+
+        # 绑定事件
+        run_btn.click(
+            run_alignment,
+            inputs=[
+                audio_input, text_input,
+                model_dropdown, device_dropdown, compute_dropdown,
+                language_box, beam_slider, vad_check,
+                hotwords_box,  # 新增热词输入
+                align_model_dropdown, auto_match_check,
+                granularity_radio,
+                punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+                silence_slider, merge_punc, merge_silence, merge_wordcount,
+                merge_charcount, merge_duration, merge_newline
+            ],
+            outputs=[status_box, word_output, sent_output, merged_output, status_box]
         )
 
-        with gr.Accordion("系统状态信息 (点击展开/折叠)", open=False):
-            with gr.Row():
-                status_display = gr.Textbox(
-                    label="系统状态", value=get_system_info(), lines=6, interactive=False, scale=4
-                )
-                with gr.Column(scale=1):
-                    refresh_btn = gr.Button("刷新状态", variant="secondary")
-                    health_btn = gr.Button("健康检查", variant="secondary")
-            health_btn.click(health_check, outputs=[status_display])
+        clear_btn.click(
+            clear_outputs,
+            outputs=[status_box, word_output, sent_output, merged_output, status_box]
+        ).then(
+            lambda: [None, "", ""],
+            outputs=[audio_input, text_input, hotwords_box]  # 清空热词框
+        )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                device = gr.Dropdown(label="设备", choices=device_choices, value=device_choices[0])
-                model_size = gr.Dropdown(
-                    label="模型大小", choices=model_choices,
-                    value=model_choices[0] if model_choices else "medium"
-                )
-            with gr.Column(scale=1):
-                compute_type = gr.Dropdown(label="计算类型", choices=compute_type_choices, value="int8_float32")
-                language = gr.Textbox(label="语言代码 (留空自动检测)", value="zh", placeholder="例如: zh, en, ja")
+        refresh_align_btn.click(
+            refresh_align_model_list,
+            outputs=[align_model_dropdown]
+        )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                load_btn = gr.Button("加载模型", variant="primary")
-                unload_btn = gr.Button("卸载模型", variant="stop")
-            with gr.Column(scale=1):
-                beam_size = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)
-                vad_filter = gr.Checkbox(label="启用 VAD 过滤", value=True)
-
-        load_btn.click(load_model_click, inputs=[model_size, device, compute_type, language],
-                       outputs=[status_display, status_display])
-        unload_btn.click(unload_model_click, outputs=[status_display, status_display])
-        refresh_btn.click(refresh_status, outputs=[status_display])
-
-        gr.Markdown("---")
-
-        with gr.Tabs():
-
-            with gr.Tab("音频识别"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        audio_input = gr.Audio(label="选择或录制音频", type="numpy",
-                                               sources=["upload", "microphone"])
-                        hotwords_audio = gr.Textbox(
-                            label="热词/提示词 (initial_prompt)",
-                            placeholder="例如：以下是关于人工智能的讨论，重点关注术语：Transformer、扩散模型",
-                            lines=2,
-                            value=""
-                        )
-                        with gr.Row():
-                            transcribe_btn = gr.Button("开始识别", variant="primary")
-                            clear_btn = gr.Button("清空", variant="secondary")
-                    with gr.Column(scale=2):
-                        with gr.Tabs():
-                            with gr.Tab("识别文本"):
-                                text_output = gr.Textbox(label="结果", lines=15, show_copy_button=True)
-                            with gr.Tab("时间戳 (JSON)"):
-                                json_output = gr.Textbox(label="时间戳数据", lines=15, show_copy_button=True)
-                            with gr.Tab("SRT字幕"):
-                                srt_output = gr.Textbox(label="SRT字幕", lines=15, show_copy_button=True)
-                            with gr.Tab("字幕预览"):
-                                preview_output = gr.HTML(label="字幕预览",
-                                                         value=generate_subtitle_html([], None))
-
-                transcribe_btn.click(
-                    transcribe_audio,
-                    inputs=[audio_input, model_size, device, compute_type, language, beam_size, vad_filter, hotwords_audio],
-                    outputs=[text_output, json_output, srt_output, preview_output]
-                ).then(refresh_status, outputs=[status_display])
-
-                clear_btn.click(
-                    lambda: [None, "", "", "", "", generate_subtitle_html([], None)],
-                    outputs=[audio_input, hotwords_audio, text_output, json_output, srt_output, preview_output]
-                )
-
-            with gr.Tab("视频字幕"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        video_input = gr.Video(label="选择视频文件", sources=["upload"], interactive=True)
-                        subtitle_mode = gr.Radio(label="字幕嵌入模式", choices=["soft", "hard"], value="soft")
-                        hotwords_video = gr.Textbox(
-                            label="热词/提示词 (initial_prompt)",
-                            placeholder="例如：以下是关于人工智能的讨论，重点关注术语：Transformer、扩散模型",
-                            lines=2,
-                            value=""
-                        )
-                        with gr.Row():
-                            video_transcribe_btn = gr.Button("开始处理", variant="primary")
-                            video_clear_btn = gr.Button("清空", variant="secondary")
-                    with gr.Column(scale=2):
-                        with gr.Tabs():
-                            with gr.Tab("识别文本"):
-                                video_text_output = gr.Textbox(label="结果", lines=15, show_copy_button=True)
-                            with gr.Tab("时间戳 (JSON)"):
-                                video_json_output = gr.Textbox(label="时间戳数据", lines=15, show_copy_button=True)
-                            with gr.Tab("SRT字幕"):
-                                video_srt_output = gr.Textbox(label="SRT字幕", lines=15, show_copy_button=True)
-
-                video_transcribe_btn.click(
-                    transcribe_video,
-                    inputs=[video_input, model_size, device, compute_type, language, beam_size, vad_filter, subtitle_mode, hotwords_video],
-                    outputs=[video_text_output, video_json_output, video_srt_output]
-                ).then(refresh_status, outputs=[status_display])
-
-                video_clear_btn.click(
-                    lambda: [None, "", "", "", ""],
-                    outputs=[video_input, hotwords_video, video_text_output, video_json_output, video_srt_output]
-                )
-
-            with gr.Tab("批量处理"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        file_input = gr.Files(
-                            label="上传多个音频文件",
-                            file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"],
-                            file_count="multiple"
-                        )
-                        hotwords_batch = gr.Textbox(
-                            label="热词/提示词 (initial_prompt)",
-                            placeholder="例如：以下是关于人工智能的讨论，重点关注术语：Transformer、扩散模型",
-                            lines=2,
-                            value=""
-                        )
-                        batch_transcribe_btn = gr.Button("批量识别", variant="primary")
-                        batch_clear = gr.Button("清空", variant="secondary")
-                    with gr.Column(scale=2):
-                        batch_output = gr.Textbox(label="批量结果", lines=20, show_copy_button=True)
-
-                batch_transcribe_btn.click(
-                    transcribe_batch,
-                    inputs=[file_input, model_size, device, compute_type, language, beam_size, vad_filter, hotwords_batch],
-                    outputs=[batch_output, gr.State(), gr.State()]
-                ).then(refresh_status, outputs=[status_display])
-
-                batch_clear.click(
-                    lambda: [None, "", ""],
-                    outputs=[file_input, hotwords_batch, batch_output]
-                )
-
-            with gr.Tab("字幕自动打轴 (文稿生字幕)"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        align_audio = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"])
-                        align_text = gr.Textbox(
-                            label="粘贴稿子文本", lines=12,
-                            placeholder="将稿子文本粘贴到这里...\n段落之间请用空行（连续两个换行符）分隔。"
-                        )
-                        align_granularity = gr.Radio(
-                            label="对齐粒度", choices=[("字符级（中文）", "char"), ("单词级（英文等）", "word")],
-                            value="char", info="字符级适合中文（逐字对齐），单词级适合英文、日文罗马字等"
-                        )
-                        hotwords_align = gr.Textbox(
-                            label="热词/提示词 (initial_prompt)",
-                            placeholder="例如：以下是关于人工智能的讨论，重点关注术语：Transformer、扩散模型",
-                            lines=2,
-                            value=""
-                        )
-                        gr.Markdown("###  多语种对齐模型")
-                        with gr.Row():
-                            align_model_dropdown = gr.Dropdown(
-                                label="对齐模型", choices=align_choices, value="无（使用默认）",
-                                interactive=True
-                            )
-                            refresh_align_btn = gr.Button("刷新列表", size="sm")
-                        auto_match_check = gr.Checkbox(
-                            label="根据语言代码自动匹配（推荐）", value=True,
-                            info="勾选后将根据左侧语言代码自动选择最合适的对齐模型"
-                        )
-                        with gr.Accordion("字幕合并参数", open=False):
-                            merge_punctuations = gr.Textbox(label="句末标点符号", value="。！？.!?")
-                            with gr.Row():
-                                merge_max_words = gr.Slider(label="最大词数", minimum=5, maximum=50,
-                                                            value=20, step=1)
-                                merge_max_chars = gr.Slider(label="最大字符数", minimum=5, maximum=100,
-                                                            value=30, step=5)
-                            with gr.Row():
-                                merge_max_duration = gr.Slider(label="最大时长 (秒)", minimum=1.0,
-                                                                maximum=20.0, value=10.0, step=0.5)
-                                merge_silence_threshold = gr.Slider(label="静音阈值 (秒)", minimum=0.1,
-                                                                    maximum=1.0, value=0.3, step=0.05)
-                            with gr.Row():
-                                merge_by_punc = gr.Checkbox(label="根据标点断句", value=True)
-                                merge_by_silence = gr.Checkbox(label="根据静音断句", value=True)
-                                merge_by_wordcount = gr.Checkbox(label="根据词数断句", value=True)
-                            with gr.Row():
-                                merge_by_charcount = gr.Checkbox(label="根据字符数断句", value=True)
-                                merge_by_duration = gr.Checkbox(label="根据时长断句", value=True)
-                                merge_by_newline = gr.Checkbox(
-                                    label="根据空行断句", value=True,
-                                    info="强烈推荐：勾选此项将严格按稿子中的空行分段"
-                                )
-
-                        with gr.Row():
-                            align_btn = gr.Button("生成精准字幕", variant="primary")
-                            align_clear = gr.Button("清空", variant="secondary")
-
-                    with gr.Column(scale=2):
-                        align_status_box = gr.Textbox(
-                            label="对齐状态", value=get_system_info(), lines=5,
-                            interactive=False, show_copy_button=True
-                        )
-                        with gr.Tabs():
-                            with gr.Tab("逐词/逐字 SRT"):
-                                align_word_output = gr.Textbox(label="逐词字幕", lines=40,
-                                                                show_copy_button=True)
-                            with gr.Tab("整句 SRT (按空行)"):
-                                align_sent_output = gr.Textbox(label="整句子幕", lines=40,
-                                                               show_copy_button=True)
-                            with gr.Tab("合并字幕"):
-                                align_merged_output = gr.Textbox(label="合并后的字幕", lines=40,
-                                                                  show_copy_button=True)
-
-                align_btn.click(
-                    force_align_wrapper,
-                    inputs=[
-                        align_audio, align_text, model_size, device, compute_type, language,
-                        beam_size, vad_filter, align_granularity, hotwords_align,
-                        align_model_dropdown, auto_match_check,
-                        merge_punctuations, merge_max_words, merge_max_chars,
-                        merge_max_duration, merge_silence_threshold, merge_by_punc, merge_by_silence,
-                        merge_by_wordcount, merge_by_charcount, merge_by_duration, merge_by_newline
-                    ],
-                    outputs=[align_word_output, align_sent_output, align_merged_output, align_status_box]
-                ).then(refresh_status, outputs=[status_display])
-
-                align_clear.click(
-                    lambda: [None, "", "", "", "", "", "", "", "", get_system_info()],
-                    outputs=[align_audio, align_text, hotwords_align, align_word_output,
-                             align_sent_output, align_merged_output, align_status_box]
-                )
-
-                refresh_align_btn.click(
-                    refresh_align_model_list,
-                    outputs=[align_model_dropdown]
-                )
-
-            with gr.Tab("系统信息"):
-                with gr.Column():
-                    system_info_text = gr.Textbox(label="详细信息", value=get_system_info(),
-                                                  lines=20, show_copy_button=True)
-                    with gr.Row():
-                        output_dir_input = gr.Textbox(label="输出目录", value=str(OUTPUT_DIR),
-                                                      interactive=True, scale=3)
-                        update_output_btn = gr.Button("更新输出目录", variant="secondary", scale=1)
-                    with gr.Row():
-                        preview_max_size = gr.Slider(
-                            label="字幕预览最大文件大小 (MB)", minimum=1, maximum=100,
-                            value=manager.settings.get("preview_max_size_mb", 5), step=1
-                        )
-                    def save_preview_size(size):
-                        manager.settings["preview_max_size_mb"] = size
-                        save_settings(manager.settings)
-                        return f"预览大小已保存为 {size} MB"
-                    preview_max_size.change(save_preview_size, inputs=[preview_max_size], outputs=[gr.State()])
-
-                    with gr.Row():
-                        open_output_btn = gr.Button("打开输出目录")
-                        open_log_btn = gr.Button("打开日志文件夹")
-                        clear_cache_btn = gr.Button("清理临时文件")
-                    with gr.Row():
-                        save_config_btn = gr.Button("保存当前配置", variant="primary")
-                        preset_files = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")],
-                                              reverse=True)
-                        preset_selector = gr.Dropdown(label="选择预设文件", choices=preset_files,
-                                                      value=None, interactive=True)
-                        load_config_btn = gr.Button("加载所选配置", variant="secondary")
-                        refresh_preset_btn = gr.Button("刷新列表", variant="secondary", size="sm")
-                    config_status = gr.Textbox(label="配置状态", interactive=False)
-
-                def update_output_dir(new_dir, new_preview_size):
-                    global OUTPUT_DIR, ALIGN_OUTPUT_DIR
-                    try:
-                        p = Path(new_dir)
-                        p.mkdir(parents=True, exist_ok=True)
-                        with config_lock:
-                            OUTPUT_DIR = p
-                            ALIGN_OUTPUT_DIR = p / "字幕自动打轴"
-                            ALIGN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                            manager.settings["output_dir"] = str(p)
-                            manager.settings["preview_max_size_mb"] = new_preview_size
-                            save_settings(manager.settings)
-                        return f"输出目录已更新为 {p}，预览阈值已设为 {new_preview_size} MB", get_system_info()
-                    except Exception as e:
-                        return f"更新失败: {e}", get_system_info()
-
-                update_output_btn.click(update_output_dir,
-                                        inputs=[output_dir_input, preview_max_size],
-                                        outputs=[config_status, system_info_text])
-
-                def open_output():
-                    os.startfile(str(OUTPUT_DIR))
-                    return "已打开输出目录"
-
-                open_output_btn.click(open_output, outputs=[config_status])
-
-                def open_log():
-                    os.startfile(str(LOG_DIR))
-                    return "已打开日志文件夹"
-
-                open_log_btn.click(open_log, outputs=[config_status])
-
-                def clear_cache():
-                    cleaned = manager.cleanup_temp()
-                    return f"清理了 {cleaned} 个临时文件"
-
-                clear_cache_btn.click(clear_cache, outputs=[config_status])
-
-                def save_current_config():
-                    config = {
-                        "model_size": model_size.value,
-                        "device": device.value,
-                        "compute_type": compute_type.value,
-                        "language": language.value,
-                        "beam_size": beam_size.value,
-                        "vad_filter": vad_filter.value,
-                        "align_granularity": align_granularity.value,
-                        "merge_punctuations": merge_punctuations.value,
-                        "merge_max_words": merge_max_words.value,
-                        "merge_max_chars": merge_max_chars.value,
-                        "merge_max_duration": merge_max_duration.value,
-                        "merge_silence_threshold": merge_silence_threshold.value,
-                        "merge_by_punc": merge_by_punc.value,
-                        "merge_by_silence": merge_by_silence.value,
-                        "merge_by_wordcount": merge_by_wordcount.value,
-                        "merge_by_charcount": merge_by_charcount.value,
-                        "merge_by_duration": merge_by_duration.value,
-                        "merge_by_newline": merge_by_newline.value,
-                        "preview_max_size_mb": preview_max_size.value,
-                    }
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    preset_path = PRESET_DIR / f"preset_{timestamp}.json"
-                    with open(preset_path, "w", encoding="utf-8") as f:
-                        json.dump(config, f, ensure_ascii=False, indent=2)
-                    new_choices = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")], reverse=True)
-                    return f"配置已保存到 {preset_path}", gr.update(choices=new_choices)
-
-                save_config_btn.click(save_current_config, outputs=[config_status, preset_selector])
-
-                def refresh_preset_list():
-                    new_choices = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")], reverse=True)
-                    return gr.update(choices=new_choices)
-
-                refresh_preset_btn.click(refresh_preset_list, outputs=[preset_selector])
-
-                def load_selected_config(filename):
-                    if not filename:
-                        return ["请先选择一个预设文件"] + [gr.update() for _ in range(19)]
-                    file_path = PRESET_DIR / filename
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            cfg = json.load(f)
-                    except Exception as e:
-                        return [f"加载失败: {e}"] + [gr.update() for _ in range(19)]
-                    updates = [
-                        gr.update(value=cfg.get("model_size", "medium")),
-                        gr.update(value=cfg.get("device", device_choices[0])),
-                        gr.update(value=cfg.get("compute_type", "int8_float32")),
-                        gr.update(value=cfg.get("language", "zh")),
-                        gr.update(value=cfg.get("beam_size", 5)),
-                        gr.update(value=cfg.get("vad_filter", True)),
-                        gr.update(value=cfg.get("align_granularity", "char")),
-                        gr.update(value=cfg.get("merge_punctuations", "。！？.!?")),
-                        gr.update(value=cfg.get("merge_max_words", 20)),
-                        gr.update(value=cfg.get("merge_max_chars", 30)),
-                        gr.update(value=cfg.get("merge_max_duration", 10.0)),
-                        gr.update(value=cfg.get("merge_silence_threshold", 0.3)),
-                        gr.update(value=cfg.get("merge_by_punc", True)),
-                        gr.update(value=cfg.get("merge_by_silence", True)),
-                        gr.update(value=cfg.get("merge_by_wordcount", True)),
-                        gr.update(value=cfg.get("merge_by_charcount", True)),
-                        gr.update(value=cfg.get("merge_by_duration", True)),
-                        gr.update(value=cfg.get("merge_by_newline", False)),
-                        gr.update(value=cfg.get("preview_max_size_mb", 5)),
-                    ]
-                    return [f"配置已加载: {filename}"] + updates
-
-                load_config_btn.click(
-                    load_selected_config,
-                    inputs=[preset_selector],
-                    outputs=[
-                        config_status, model_size, device, compute_type, language,
-                        beam_size, vad_filter, align_granularity,
-                        merge_punctuations, merge_max_words, merge_max_chars,
-                        merge_max_duration, merge_silence_threshold,
-                        merge_by_punc, merge_by_silence, merge_by_wordcount,
-                        merge_by_charcount, merge_by_duration, merge_by_newline, preview_max_size
-                    ]
-                )
-
-        gr.Markdown("---")
+        # 页脚
         gr.HTML("""
-<div class="notice" style="margin: 10px 0; padding: 10px; background: transparent; border-left: 4px solid #ff9800; font-size: 0.9em;">
-    注意事项：<br>
-    &bull; 本工具仅用于个人学习与视频剪辑使用<br>
-    &bull; 禁止用于商业用途及侵权行为<br>
-    &bull; 使用前确保模型与依赖环境正常配置
-</div>
-<div style="text-align: center; color: #666; font-size: 0.9em; margin-top: 15px;">
-    <p>本软件包不提供任何模型文件，模型由用户自行从官方渠道获取。用户需自行遵守模型的原许可证。</p>
-    <p>本软件包按"原样"提供，不提供任何明示或暗示的担保。使用本软件所产生的一切风险由用户自行承担。</p>
-    <p>本软件包开发者不对因使用本软件而导致的任何直接或间接损失负责。</p>
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 8px; margin: 15px auto; max-width: 600px;">
-        <p style="color: white; font-weight: bold; margin: 5px 0; font-size: 1em;">更新请关注B站up主：光影的故事2018</p>
-        <p style="color: white; margin: 5px 0; font-size: 0.9em;">
-            <strong>B站主页</strong>:
-            <a href="https://space.bilibili.com/381518712" target="_blank" style="color: #ffdd40; text-decoration: none; font-weight: bold;">
+        <div style="text-align: center; color: #666; font-size: 0.85em; margin-top: 20px;">
+            <p>本软件包按“原样”提供，不提供任何明示或暗示的担保。使用本软件所产生的一切风险由用户自行承担。</p>
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 12px; border-radius: 8px; margin: 15px auto; max-width: 600px;">
+                <p style="color: white; font-weight: bold; margin: 5px 0; font-size: 1em;">更新请关注B站up主：光影的故事2018</p>
+                <p style="color: white; margin: 5px 0; font-size: 0.9em;">
+                <strong>B站主页</strong>: 
+                <a href="https://space.bilibili.com/381518712" target="_blank" style="color: #ffdd40; text-decoration: none; font-weight: bold;">
                 space.bilibili.com/381518712
-            </a>
-        </p>
-    </div>
-</div>
-<div style="text-align: center; color: #666; margin-top: 10px; font-size: 0.9em;">
-    &copy; 原创 WebUI 代码 &copy; 2026 光影紐扣 版权所有
-</div>
-""")
-
-        demo.load(refresh_status, outputs=[status_display])
+                </a>
+                </p>
+            </div>
+            <p>© 原创 WebUI 代码 © 2026 光影紐扣 版权所有</p>
+        </div>
+        """)
 
     return demo
 
-# ==================== 退出清理 ====================
-@atexit.register
-def cleanup():
-    print("正在退出，清理资源...")
-    manager.unload_models()
-    manager.cleanup_temp()
-    clean_old_logs()
-    print("清理完成")
-
-# ==================== 主函数 ====================
 def main():
-    demo = create_interface()
-    demo.queue().launch(
-        server_name="127.0.0.1",
-        server_port=18006,
-        inbrowser=True,
-        show_error=True
-    )
+    demo = create_ui()
+    ports_to_try = [7966, 7967, 7969, 7962, 7969]
+    for port in ports_to_try:
+        try:
+            demo.launch(
+                server_name="127.0.0.1",
+                server_port=port,
+                inbrowser=True
+            )
+            break
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+            continue
+    else:
+        print("所有端口均被占用，请手动指定空闲端口。")
 
 if __name__ == "__main__":
     main()
