@@ -165,7 +165,7 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
         # 按钮组
         with gr.Column(elem_classes="btn-group"):
             btn_asr = gr.Button("📄 语音转字幕", elem_id="btn_asr")
-            btn_align = gr.Button("🎯 语音转字幕（对齐）", elem_id="btn_align")  # 新增对齐脚本按钮
+            btn_align = gr.Button("🎬 语音转字幕（对齐）", elem_id="btn_align")  # 新增对齐脚本按钮
             btn_clean = gr.Button("✨ 字幕清洗", elem_id="btn_clean")
             btn_trans = gr.Button("🔤 字幕转换", elem_id="btn_trans")
             btn_translate = gr.Button("🤖 在线AI助手", elem_id="btn_translate")
