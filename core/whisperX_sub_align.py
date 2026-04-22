@@ -5,6 +5,7 @@
 基于 WhisperX，提供图形界面进行文稿与音频的强制对齐，支持副文稿挂载生成双语字幕
 布局：左侧音频+主/副文稿，右侧所有参数折叠面板
 修复：输出绑定错误、线程安全、音频输入类型、WhisperX fallback、字符时长下限等
+修复(2026.04.22)：WhisperX 字符级对齐提取逻辑 + VAD 离线环境容错
 Copyright 2026 光影的故事2018
 """
 
@@ -108,7 +109,6 @@ def force_align_char_level(reference_text: str, transcribed_words: List[Dict],
         for j in range(i - 1, -1, -1):
             if match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
                 count_in_word += 1
-                total_in_word += 1
             else:
                 break
         for j in range(i + 1, len(ref_chars)):
@@ -143,8 +143,8 @@ def force_align_word_level(reference_text: str, transcribed_words: List[Dict],
             if hyp_idx + offset >= len(hyp_words):
                 break
             hyp_w = hyp_words[hyp_idx + offset]
-            ref_clean = re.sub(r'[^\w]', '', ref_w.lower())
-            hyp_clean = re.sub(r'[^\w]', '', hyp_w.lower())
+            ref_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', ref_w.lower(), flags=re.UNICODE)
+            hyp_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', hyp_w.lower(), flags=re.UNICODE)
             if ref_clean == hyp_clean or ref_clean in hyp_clean or hyp_clean in ref_clean:
                 w_idx = hyp_idx + offset
                 aligned.append({
@@ -160,7 +160,7 @@ def force_align_word_level(reference_text: str, transcribed_words: List[Dict],
                 start = transcribed_words[hyp_idx]["start"]
                 end = transcribed_words[hyp_idx]["end"]
             else:
-                start = aligned[-1]["end"] if aligned else 0.0
+                start = transcribed_words[-1]["end"] if transcribed_words else 0.0
                 end = start + avg_duration
             aligned.append({"word": ref_w, "start": start, "end": end})
     return aligned
@@ -333,15 +333,25 @@ class AlignModelManager:
                 vad_filter=vad_filter, word_timestamps=True,
                 initial_prompt=initial_prompt
             )
-            seg_list = []
-            for seg in segments:
-                seg_dict = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-                if seg.words:
-                    seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
-                seg_list.append(seg_dict)
-            return {"language": info.language, "segments": seg_list}, None
         except Exception as e:
-            return None, str(e)
+            # 修复：离线环境下 VAD 模型缺失时的自动降级
+            if vad_filter and ("vad" in str(e).lower() or "offline" in str(e).lower()):
+                print(f"VAD 模型加载失败，自动关闭 VAD 并重试。原始错误: {e}")
+                segments, info = self.model.transcribe(
+                    audio_path, language=language, beam_size=beam_size,
+                    vad_filter=False, word_timestamps=True,
+                    initial_prompt=initial_prompt
+                )
+            else:
+                return None, str(e)
+
+        seg_list = []
+        for seg in segments:
+            seg_dict = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+            if seg.words:
+                seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end} for w in seg.words]
+            seg_list.append(seg_dict)
+        return {"language": info.language, "segments": seg_list}, None
 
     def load_align_model(self, language_code: str, device: str, model_name: str = None, model_dir: str = None):
         with self.lock:
@@ -401,47 +411,41 @@ def get_system_status(align_model_info: str = ""):
         lines.append(f"对齐模型: {align_model_info}")
     return "\n".join(lines)
 
-# ==================== 公共提取单词函数 ====================
+# ==================== 公共提取单词函数（已修复） ====================
 def extract_words_from_result(result: Dict, align_granularity: str, use_whisperx_align: bool) -> List[Dict]:
-    """统一的单词/字符时间戳提取逻辑"""
+    """
+    统一的单词/字符时间戳提取逻辑。
+    修复：正确处理 WhisperX 字符级对齐输出中的 `chars` 字段。
+    """
     words = []
-    if use_whisperx_align:
-        # 精细对齐结果
-        for seg in result.get("segments", []):
-            if "words" in seg and seg["words"]:
-                seg_words = seg["words"]
-                for i, w in enumerate(seg_words):
-                    if "start" in w and "end" in w and "word" in w:
-                        words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
+    for seg in result.get("segments", []):
+        if "words" not in seg or not seg["words"]:
+            continue
+        seg_words = seg["words"]
+        for i, w in enumerate(seg_words):
+            # --- WhisperX 字符级对齐路径 ---
+            if use_whisperx_align and align_granularity == "char" and "chars" in w:
+                for c in w["chars"]:
+                    if "char" in c and "start" in c and "end" in c:
+                        words.append({"word": c["char"], "start": c["start"], "end": c["end"]})
                     else:
-                        # 估算缺失时间戳
-                        prev_word = seg_words[i-1] if i > 0 else None
-                        next_word = seg_words[i+1] if i < len(seg_words)-1 else None
-                        start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
-                        end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start+0.01)
-                        word_text = w.get("word", w.get("char", ""))
-                        if word_text:
-                            words.append({"word": word_text, "start": start, "end": end})
-            elif "char-segments" in seg and align_granularity == "char":
-                for char_seg in seg["char-segments"]:
-                    if "char" in char_seg and "start" in char_seg and "end" in char_seg:
-                        words.append({"word": char_seg["char"], "start": char_seg["start"], "end": char_seg["end"]})
-    else:
-        # 回退：faster-whisper 自带单词时间戳
-        for seg in result.get("segments", []):
-            if "words" in seg and seg["words"]:
-                seg_words = seg["words"]
-                for i, w in enumerate(seg_words):
-                    if "start" in w and "end" in w and "word" in w:
-                        words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
-                    else:
-                        prev_word = seg_words[i-1] if i > 0 else None
-                        next_word = seg_words[i+1] if i < len(seg_words)-1 else None
-                        start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
-                        end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start+0.01)
-                        word_text = w.get("word", "")
-                        if word_text:
-                            words.append({"word": word_text, "start": start, "end": end})
+                        # 极端情况：字符缺失时间戳，使用单词边界兜底
+                        char_text = c.get("char", "")
+                        if char_text:
+                            words.append({"word": char_text, "start": w.get("start", 0.0), "end": w.get("end", 0.0)})
+            else:
+                # --- 单词级路径（WhisperX 单词级或 faster-whisper 回退）---
+                if "start" in w and "end" in w and "word" in w:
+                    words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
+                else:
+                    # 缺失时间戳时的插值估算
+                    prev_word = seg_words[i-1] if i > 0 else None
+                    next_word = seg_words[i+1] if i < len(seg_words)-1 else None
+                    start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
+                    end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start+0.01)
+                    word_text = w.get("word", "")
+                    if word_text:
+                        words.append({"word": word_text, "start": start, "end": end})
     return words
 
 def safe_audio_path(audio_input: Union[str, tuple, dict, None]) -> Optional[str]:
@@ -569,7 +573,7 @@ def run_alignment(
             use_whisperx_align = False
             result = original_result  # 恢复原始结果，避免结构不一致
 
-    # ---- 4. 提取单词时间戳（统一函数） ----
+    # ---- 4. 提取单词时间戳（统一函数，已修复） ----
     words = extract_words_from_result(result, align_granularity, use_whisperx_align)
 
     if not words:
@@ -600,7 +604,7 @@ def run_alignment(
     sentences = []
     if align_granularity == "char":
         for para in paragraphs:
-            para_char_count = len([ch for ch in para if not ch.isspace()])
+            para_char_count = len([ch for ch in para if ch.strip()])  # 过滤所有空白字符
             start_idx = char_pos
             end_idx = char_pos + para_char_count
             if start_idx >= len(aligned):
@@ -880,7 +884,7 @@ def create_ui():
                         merge_charcount = gr.Checkbox(label="按字符数断句", value=True)
                         merge_duration = gr.Checkbox(label="按时长断句", value=True)
                     with gr.Row():
-                        punc_box = gr.Textbox(label="句末标点", value="。！？.!?", scale=2)
+                        punc_box = gr.Textbox(label="句末标点", value="，；。！？,;.!?", scale=2)
                         silence_slider = gr.Slider(label="静音阈值 (秒)", minimum=0.1, maximum=1.0, value=0.3, step=0.05, scale=1)
                     with gr.Row():
                         max_words_slider = gr.Slider(label="最大词数", minimum=5, maximum=50, value=20, step=1)
