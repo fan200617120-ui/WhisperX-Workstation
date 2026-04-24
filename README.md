@@ -242,37 +242,7 @@ WhisperX Studio – All-in-One Speech &amp; Subtitle Workstation
 
 ## 许可证与法律声明
 
-本项目基于 **Apache License, Version 2.0** 开源。以下是完整许可证文本（摘要）：
-
-```
-Copyright 2026 光影的故事2018
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-**完整版 Apache 2.0 许可证**（请复制以下内容到项目根目录的 `LICENSE` 文件中）：
-
-```
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
-
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-   1. Definitions.
-      ...
-      (完整文本请参见 https://www.apache.org/licenses/LICENSE-2.0)
-```
+本项目基于 **Apache License, Version 2.0** 开源。
 
 ### 附加声明
 
