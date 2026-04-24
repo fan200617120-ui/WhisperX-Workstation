@@ -4,7 +4,8 @@
 WhisperX WebUI 全功能版 - 自动扫描本地模型，支持多语种强制对齐
 包含：音频识别、视频字幕、批量处理、强制对齐（WhisperX精细对齐+回退算法）
 新增：热词/提示词功能（initial_prompt），多语种对齐模型选择
-修复(2026.04.22)：WhisperX字符级对齐提取逻辑 + VAD离线环境容错
+修复(2026.04.24)：同步字幕自动打轴的增强对齐算法（段落动态规划匹配、字符级未匹配字符处理、
+              静音断句保护等），修复音频预处理、视频硬字幕路径、端口占用等多项问题
 Copyright 2026 光影的故事2018
 """
 import sys
@@ -23,8 +24,10 @@ import base64
 import subprocess
 import shutil
 import html
+import copy
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
+
 sys.setrecursionlimit(10000)
 
 # ==================== 日志设置 ====================
@@ -41,6 +44,7 @@ def clean_old_logs(days=7):
 clean_old_logs()
 log_file = LOG_DIR / f"error_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(filename=log_file, level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ==================== 路径设置 ====================
 CURRENT_DIR = Path(__file__).parent.absolute()
@@ -143,26 +147,44 @@ def sentences_to_srt(sentences: List[Dict]) -> str:
         lines.append("")
     return "\n".join(lines)
 
-def force_align_char_level(reference_text, transcribed_words, audio_duration=None):
-    """字符级对齐（中文等）"""
+def normalize_text_for_alignment(text: str, granularity: str) -> str:
+    """规范化文稿文本，仅保留对齐所需的字符。"""
+    if granularity == "char":
+        return re.sub(r'[^\w\u4e00-\u9fff]', '', text, flags=re.UNICODE)
+    else:
+        return re.sub(r'[^\w\s\u4e00-\u9fff]', '', text, flags=re.UNICODE).strip()
+
+# ---------- 改进的对齐核心函数（同步自 whisperX_sub_align.py） ----------
+def force_align_char_level(reference_text: str, transcribed_words: List[Dict],
+                           audio_duration: Optional[float] = None) -> List[Dict]:
+    """增强版字符级对齐，包含标点过滤和更健壮的匹配。修复：未匹配字符均匀分配时间戳。"""
     if not transcribed_words:
         return []
-    ref_chars = [ch for ch in reference_text if not ch.isspace()]
+
+    ref_chars = [ch for ch in reference_text if ch.strip() and (ch.isalnum() or '\u4e00' <= ch <= '\u9fff')]
+    if not ref_chars:
+        return []
+
     hyp_chars = []
     char_to_word_idx = []
     for w_idx, w in enumerate(transcribed_words):
-        for ch in w["word"]:
-            if not ch.isspace():
+        word_text = w["word"]
+        for ch in word_text:
+            if ch.strip() and (ch.isalnum() or '\u4e00' <= ch <= '\u9fff'):
                 hyp_chars.append(ch)
                 char_to_word_idx.append(w_idx)
+
     if not char_to_word_idx:
         default_end = audio_duration if audio_duration else 1.0
         return [{"word": ch, "start": 0.0, "end": default_end} for ch in ref_chars]
+
     hyp_idx = 0
     match_map = []
-    for r_char in ref_chars:
+    missing_indices = []
+
+    for i, r_char in enumerate(ref_chars):
         found = False
-        for offset in range(20):
+        for offset in range(30):
             check_idx = hyp_idx + offset
             if check_idx < len(hyp_chars) and hyp_chars[check_idx] == r_char:
                 match_map.append(check_idx)
@@ -170,67 +192,107 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
                 found = True
                 break
         if not found:
-            match_map.append(hyp_idx - 1 if hyp_idx > 0 else 0)
+            match_map.append(-1)
+            missing_indices.append(i)
+
     aligned = []
     for i, r_char in enumerate(ref_chars):
-        matched_hyp_idx = match_map[i]
-        if matched_hyp_idx < len(char_to_word_idx):
-            w_idx = char_to_word_idx[matched_hyp_idx]
+        if match_map[i] != -1 and match_map[i] < len(char_to_word_idx):
+            w_idx = char_to_word_idx[match_map[i]]
+            start_t = transcribed_words[w_idx]["start"]
+            end_t = transcribed_words[w_idx]["end"]
+
+            # 统计该字符在单词内的位置
+            count_in_word = 1
+            total_in_word = 1
+            for j in range(i - 1, -1, -1):
+                if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
+                    count_in_word += 1
+                else:
+                    break
+            for j in range(i + 1, len(ref_chars)):
+                if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
+                    total_in_word += 1
+                else:
+                    break
+
+            word_duration = end_t - start_t
+            char_duration = max(word_duration / total_in_word, 0.02) if total_in_word > 0 else 0.02
+            char_start = start_t + (count_in_word - 1) * char_duration
+            char_end = char_start + char_duration
+            aligned.append({"word": r_char, "start": char_start, "end": char_end})
         else:
-            w_idx = char_to_word_idx[-1]
-        start_t = transcribed_words[w_idx]["start"]
-        end_t = transcribed_words[w_idx]["end"]
-        # 修复：正确统计字符在单词中的位置
-        count_in_word = 1
-        for j in range(i - 1, -1, -1):
-            if match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
-                count_in_word += 1
-            else:
-                break
-        chars_after = 0
-        for j in range(i + 1, len(ref_chars)):
-            if match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
-                chars_after += 1
-            else:
-                break
-        total_chars_in_word = count_in_word + chars_after
-        word_duration = end_t - start_t
-        char_duration = max(word_duration / total_chars_in_word, 0.02) if total_chars_in_word > 0 else 0.02
-        char_start = start_t + (count_in_word - 1) * char_duration
-        char_end = char_start + char_duration
-        aligned.append({"word": r_char, "start": char_start, "end": char_end})
+            # 未匹配字符：在前后已匹配字符之间均匀分配
+            prev_time = transcribed_words[0]["start"] if transcribed_words else 0.0
+            next_time = transcribed_words[-1]["end"] if transcribed_words else (audio_duration or 1.0)
+            for j in range(i - 1, -1, -1):
+                if match_map[j] != -1 and match_map[j] < len(char_to_word_idx):
+                    w_idx_prev = char_to_word_idx[match_map[j]]
+                    prev_time = transcribed_words[w_idx_prev]["end"]
+                    break
+            for j in range(i + 1, len(ref_chars)):
+                if match_map[j] != -1 and match_map[j] < len(char_to_word_idx):
+                    w_idx_next = char_to_word_idx[match_map[j]]
+                    next_time = transcribed_words[w_idx_next]["start"]
+                    break
+            mid_time = (prev_time + next_time) / 2.0
+            avg_dur = 0.05
+            aligned.append({"word": r_char, "start": mid_time - avg_dur/2, "end": mid_time + avg_dur/2})
+
     return aligned
 
-def force_align_word_level(reference_text, transcribed_words, audio_duration=None):
-    """单词级对齐（英文等）"""
+def force_align_word_level(reference_text: str, transcribed_words: List[Dict],
+                           audio_duration: Optional[float] = None) -> List[Dict]:
+    """单词级对齐，加入中文分词检测和严格的匹配条件"""
     if not transcribed_words:
         return []
+
     ref_words = reference_text.split()
+    if not ref_words:
+        return []
+
     hyp_words = [w["word"] for w in transcribed_words]
+
     aligned = []
     hyp_idx = 0
     avg_duration = 0.3
     if len(transcribed_words) > 1:
         total_dur = transcribed_words[-1]["end"] - transcribed_words[0]["start"]
         avg_duration = max(total_dur / len(transcribed_words), 0.1)
+
     for ref_w in ref_words:
         found = False
         for offset in range(20):
             if hyp_idx + offset >= len(hyp_words):
                 break
             hyp_w = hyp_words[hyp_idx + offset]
+
             ref_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', ref_w.lower(), flags=re.UNICODE)
             hyp_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', hyp_w.lower(), flags=re.UNICODE)
-            if ref_clean == hyp_clean or ref_clean in hyp_clean or hyp_clean in ref_clean:
+
+            if not ref_clean or not hyp_clean:
+                continue
+
+            if ref_clean == hyp_clean:
                 w_idx = hyp_idx + offset
-                aligned.append({
-                    "word": ref_w,
-                    "start": transcribed_words[w_idx]["start"],
-                    "end": transcribed_words[w_idx]["end"]
-                })
+                aligned.append({"word": ref_w, "start": transcribed_words[w_idx]["start"],
+                                "end": transcribed_words[w_idx]["end"]})
                 hyp_idx = w_idx + 1
                 found = True
                 break
+            else:
+                shorter_len = min(len(ref_clean), len(hyp_clean))
+                longer_len = max(len(ref_clean), len(hyp_clean))
+                len_ratio = shorter_len / longer_len if longer_len > 0 else 0
+                if len_ratio >= 0.5 and shorter_len >= 2:
+                    if ref_clean in hyp_clean or hyp_clean in ref_clean:
+                        w_idx = hyp_idx + offset
+                        aligned.append({"word": ref_w, "start": transcribed_words[w_idx]["start"],
+                                        "end": transcribed_words[w_idx]["end"]})
+                        hyp_idx = w_idx + 1
+                        found = True
+                        break
+
         if not found:
             if hyp_idx < len(transcribed_words):
                 start = transcribed_words[hyp_idx]["start"]
@@ -239,32 +301,269 @@ def force_align_word_level(reference_text, transcribed_words, audio_duration=Non
                 start = transcribed_words[-1]["end"] if transcribed_words else 0.0
                 end = start + avg_duration
             aligned.append({"word": ref_w, "start": start, "end": end})
+
     return aligned
 
-def _generate_merged_srt(aligned_chars, sentences, paragraphs,
-                         merge_punctuations, merge_max_words, merge_max_chars,
-                         merge_max_duration, merge_by_newline,
-                         merge_by_punc, merge_by_silence, merge_by_wordcount,
-                         merge_by_charcount, merge_by_duration, silence_threshold):
-    """根据合并策略生成合并字幕"""
+def _ensure_monotonic(sentences: List[Dict]) -> List[Dict]:
+    """确保时间戳严格单调递增"""
+    if not sentences:
+        return []
+    result = [sentences[0].copy()]
+    for i in range(1, len(sentences)):
+        s = sentences[i].copy()
+        if s["start"] < result[-1]["end"]:
+            s["start"] = result[-1]["end"]
+        if s["end"] <= s["start"]:
+            s["end"] = s["start"] + 0.1
+        result.append(s)
+    return result
+
+def match_paragraphs_to_aligned(aligned_chars: List[Dict], norm_paragraphs: List[str],
+                                original_paragraphs: List[str]) -> List[Dict]:
+    """使用改进算法将规范化段落匹配到 aligned_chars 序列，返回句子列表。"""
+    if not aligned_chars or not norm_paragraphs:
+        return []
+
+    aligned_text = "".join([c["word"] for c in aligned_chars])
+    n_items = len(aligned_chars)
+    n_text = len(aligned_text)
+
+    cum_len = [0]
+    for p in norm_paragraphs:
+        cum_len.append(cum_len[-1] + len(p))
+
+    # 精确匹配
+    if aligned_text == "".join(norm_paragraphs) and n_text == n_items:
+        sentences = []
+        for i, para in enumerate(original_paragraphs):
+            s_idx = cum_len[i]
+            e_idx = cum_len[i + 1]
+            s_idx = max(0, min(s_idx, n_items - 1))
+            e_idx = max(s_idx + 1, min(e_idx, n_items))
+            seg = aligned_chars[s_idx:e_idx]
+            t_start = seg[0]["start"] if seg else 0.0
+            t_end = seg[-1]["end"] if seg else t_start + 0.1
+            if t_end <= t_start:
+                t_end = t_start + 0.1
+            sentences.append({"start": t_start, "end": t_end, "text": para})
+        return _ensure_monotonic(sentences)
+
+    # 容错匹配
+    non_empty_items = [(i, np_, op) for i, (np_, op) in enumerate(zip(norm_paragraphs, original_paragraphs)) if np_]
+    if not non_empty_items:
+        return []
+
+    matched_ranges = {}
+    search_pos = 0
+
+    for orig_idx, norm_p, orig_p in non_empty_items:
+        para_len = len(norm_p)
+        if para_len > n_text:
+            # 超长段落保护：分配整个音频长度
+            matched_ranges[orig_idx] = (0, n_text)
+            continue
+
+        best_start = -1
+        best_ratio = -1.0
+        margin_back = max(20, para_len)
+        margin_fwd = max(100, para_len * 3)
+        w_start = max(0, search_pos - margin_back)
+        w_end_max = n_text - para_len
+        if w_end_max < 0:
+            w_end_max = 0
+        w_end = min(w_end_max, search_pos + margin_fwd)
+
+        expected_pos = cum_len[orig_idx] if orig_idx < len(cum_len) else search_pos
+
+        if w_end < w_start:
+            best_start = max(0, min(expected_pos, n_text - para_len)) if para_len <= n_text else 0
+            best_ratio = 0.0
+        else:
+            for s in range(w_start, w_end + 1):
+                seg = aligned_text[s:s + para_len]
+                if len(seg) < para_len:
+                    continue
+                score = sum(1 for a, b in zip(seg, norm_p) if a == b)
+                ratio = score / para_len
+                dist = abs(s - expected_pos)
+                if ratio > best_ratio or (ratio == best_ratio and best_start != -1 and dist < abs(best_start - expected_pos)):
+                    best_ratio = ratio
+                    best_start = s
+
+        if best_start == -1:
+            best_start = max(0, min(search_pos, n_text - para_len))
+            best_ratio = 0.0
+
+        end_pos = min(best_start + para_len, n_text)
+        matched_ranges[orig_idx] = (best_start, end_pos)
+        search_pos = end_pos
+
+    sentences = []
+    for i in range(len(original_paragraphs)):
+        if i in matched_ranges:
+            s_c, e_c = matched_ranges[i]
+            s_idx = max(0, min(s_c, n_items - 1))
+            e_idx = max(s_idx + 1, min(e_c, n_items))
+            seg = aligned_chars[s_idx:e_idx]
+            if seg:
+                t_start = seg[0]["start"]
+                t_end = seg[-1]["end"]
+            else:
+                prev_end = sentences[-1]["end"] if sentences else 0.0
+                t_start = prev_end
+                t_end = prev_end + 0.3
+        else:
+            # 空段落插值
+            prev_end = sentences[-1]["end"] if sentences else 0.0
+            next_start = None
+            for k in range(i + 1, len(original_paragraphs)):
+                if k in matched_ranges:
+                    sc, _ = matched_ranges[k]
+                    nidx = max(0, min(sc, n_items - 1))
+                    next_start = aligned_chars[nidx]["start"]
+                    break
+            if next_start is not None and next_start > prev_end:
+                t_start = prev_end
+                t_end = (prev_end + next_start) / 2
+            else:
+                t_start = prev_end
+                t_end = prev_end + 0.3
+
+        if t_end <= t_start:
+            t_end = t_start + 0.1
+        sentences.append({"start": t_start, "end": t_end, "text": original_paragraphs[i]})
+
+    return _ensure_monotonic(sentences)
+
+def match_word_paragraphs_to_aligned(aligned_words: List[Dict], norm_paragraphs: List[str],
+                                      original_paragraphs: List[str]) -> List[Dict]:
+    """单词级段落匹配，使用文本搜索定位，不再假设1:1词数对应"""
+    if not aligned_words or not norm_paragraphs:
+        return []
+
+    n_aligned = len(aligned_words)
+    aligned_word_texts = [w["word"] for w in aligned_words]
+    aligned_full_text = " ".join(aligned_word_texts)
+
+    non_empty_items = [(i, np_.strip(), op) for i, (np_, op) in enumerate(zip(norm_paragraphs, original_paragraphs)) if np_.strip()]
+    if not non_empty_items:
+        return []
+
+    matched_word_ranges = {}
+    search_char_pos = 0
+
+    for orig_idx, norm_p, orig_p in non_empty_items:
+        para_len = len(norm_p)
+        best_start = -1
+        best_ratio = 0.0
+        margin_back = max(10, para_len)
+        margin_fwd = max(80, para_len * 3)
+        w_start = max(0, search_char_pos - margin_back)
+        w_end_max = len(aligned_full_text) - para_len
+        if w_end_max < 0:
+            w_end_max = 0
+        w_end = min(w_end_max, search_char_pos + margin_fwd)
+
+        if w_end < w_start:
+            best_start = search_char_pos
+            best_ratio = 0.0
+        else:
+            for s in range(w_start, w_end + 1):
+                seg = aligned_full_text[s:s + para_len]
+                if len(seg) < para_len:
+                    continue
+                score = sum(1 for a, b in zip(seg, norm_p) if a == b)
+                ratio = score / para_len if para_len > 0 else 0
+                if ratio > best_ratio or (ratio == best_ratio and best_start != -1 and abs(s - search_char_pos) < abs(best_start - search_char_pos)):
+                    best_ratio = ratio
+                    best_start = s
+
+        if best_start == -1:
+            best_start = search_char_pos
+
+        end_char_pos = min(best_start + para_len, len(aligned_full_text))
+
+        # 字符位置转单词索引
+        prefix = aligned_full_text[:best_start]
+        word_start = prefix.count(' ')
+        suffix = aligned_full_text[:end_char_pos]
+        word_end = suffix.count(' ')
+        if (end_char_pos <= len(aligned_full_text) and end_char_pos > 0 and aligned_full_text[end_char_pos - 1] != ' '):
+            word_end = word_end + 1
+        word_end = max(word_start + 1, word_end)
+        word_start = max(0, min(word_start, n_aligned - 1))
+        word_end = max(word_start + 1, min(word_end, n_aligned))
+        matched_word_ranges[orig_idx] = (word_start, word_end)
+        search_char_pos = end_char_pos
+
+    sentences = []
+    for i in range(len(original_paragraphs)):
+        if i in matched_word_ranges:
+            ws, we = matched_word_ranges[i]
+            seg = aligned_words[ws:we]
+            t_start = seg[0]["start"]
+            t_end = seg[-1]["end"]
+        else:
+            prev_end = sentences[-1]["end"] if sentences else 0.0
+            next_start = None
+            for k in range(i + 1, len(original_paragraphs)):
+                if k in matched_word_ranges:
+                    ws_k, _ = matched_word_ranges[k]
+                    ws_k = max(0, min(ws_k, n_aligned - 1))
+                    next_start = aligned_words[ws_k]["start"]
+                    break
+            if next_start is not None and next_start > prev_end:
+                t_start = prev_end
+                t_end = (prev_end + next_start) / 2
+            else:
+                t_start = prev_end
+                t_end = prev_end + 0.3
+        if t_end <= t_start:
+            t_end = t_start + 0.1
+        sentences.append({"start": t_start, "end": t_end, "text": original_paragraphs[i]})
+
+    return _ensure_monotonic(sentences)
+
+def generate_merged_srt(aligned_chars: List[Dict], sentences: List[Dict],
+                        paragraphs: List[str], merge_punctuations: str,
+                        merge_max_words: int, merge_max_chars: int,
+                        merge_max_duration: float, merge_by_newline: bool,
+                        merge_by_punc: bool, merge_by_silence: bool,
+                        merge_by_wordcount: bool, merge_by_charcount: bool,
+                        merge_by_duration: bool, silence_threshold: float,
+                        align_granularity: str = "char") -> str:
+    """生成合并字幕。修复静音断句gap为负的情况。"""
     if merge_by_newline:
         return sentences_to_srt(sentences)
+
     punc_set = set(merge_punctuations) if merge_punctuations else set()
+
+    if merge_by_punc and punc_set and align_granularity == "char":
+        has_punc = any(c["word"] in punc_set for c in aligned_chars[:500])
+        if not has_punc:
+            return sentences_to_srt(sentences)
+
     merged_segments = []
     current_chars = []
     current_start = None
+
     for i, ch_info in enumerate(aligned_chars):
         if current_start is None:
             current_start = ch_info["start"]
         current_chars.append(ch_info)
+
         should_split = False
+
         if merge_by_punc and punc_set and ch_info["word"] in punc_set:
             should_split = True
+
         if merge_by_silence and i < len(aligned_chars) - 1:
-            gap = aligned_chars[i+1]["start"] - ch_info["end"]
-            if gap > silence_threshold:
+            gap = aligned_chars[i + 1]["start"] - ch_info["end"]
+            if gap > 0 and gap > silence_threshold:
                 should_split = True
+
         text_so_far = "".join([c["word"] for c in current_chars])
+
         if merge_by_wordcount and len(current_chars) >= merge_max_words:
             should_split = True
         if merge_by_charcount and len(text_so_far) >= merge_max_chars:
@@ -272,233 +571,87 @@ def _generate_merged_srt(aligned_chars, sentences, paragraphs,
         duration = ch_info["end"] - current_start
         if merge_by_duration and duration >= merge_max_duration:
             should_split = True
+
         if should_split:
             merged_segments.append({
                 "start": current_start,
                 "end": ch_info["end"],
-                "text": text_so_far.strip()
+                "text": text_so_far.strip(),
             })
             current_chars = []
             current_start = None
+
     if current_chars:
         text = "".join([c["word"] for c in current_chars]).strip()
         if text:
             merged_segments.append({
                 "start": current_chars[0]["start"],
                 "end": current_chars[-1]["end"],
-                "text": text
+                "text": text,
             })
+
     return sentences_to_srt(merged_segments)
 
-def format_result_to_outputs(result):
-    if not result or not isinstance(result, dict):
-        return "无结果", "{}", "", []
-    text = " ".join([seg["text"] for seg in result.get("segments", [])])
-    segments = result.get("segments", [])
-    timestamps_json = json.dumps(segments, ensure_ascii=False, indent=2)
-    srt_lines = []
-    for i, seg in enumerate(segments, 1):
-        start = seconds_to_srt_time(seg["start"])
-        end = seconds_to_srt_time(seg["end"])
-        srt_lines.append(str(i))
-        srt_lines.append(f"{start} --> {end}")
-        srt_lines.append(seg["text"])
-        srt_lines.append("")
-    srt_text = "\n".join(srt_lines)
-    extra = f"语言: {result.get('language', '未知')} (概率: {result.get('language_probability', 0):.2f})"
-    full_text = f"{text}\n[元数据] {extra}"
-    return full_text, timestamps_json, srt_text, segments
-
-def generate_subtitle_html(segments, audio_path, max_size_mb=5):
-    if not audio_path or not os.path.exists(audio_path) or not segments:
-        return '<div style="padding:20px; text-align:center; color:#999;">暂无字幕预览</div>'
+def get_audio_duration_robust(audio_path: str) -> Optional[float]:
+    """稳健获取音频时长"""
     try:
-        size = os.path.getsize(audio_path) / (1024 * 1024)
-        if size > max_size_mb:
-            return (
-                '<div style="padding:20px; text-align:center; color:#666;">'
-                f'[提示] 音频文件过大 ({size:.1f} MB)，超过 {max_size_mb} MB 预览限制。</div>'
-            )
-    except:
+        return librosa.get_duration(path=audio_path)
+    except Exception:
         pass
-    mime_map = {
-        '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
-        '.flac': 'audio/flac', '.ogg': 'audio/ogg', '.aac': 'audio/aac'
-    }
-    ext = os.path.splitext(audio_path)[1].lower()
-    mime_type = mime_map.get(ext, 'audio/wav')
     try:
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-        b64_data = base64.b64encode(audio_data).decode('utf-8')
-    except Exception as e:
-        return f'<div style="color:red;">音频加载失败: {e}</div>'
-    audio_html = (
-        '<div style="margin-bottom:15px; padding:15px; background:#f8f9fa; border-radius:8px; border:1px solid #ddd;">'
-        '<div style="margin-bottom:8px; font-weight:bold; color:#333;">音频回放</div>'
-        '<audio id="preview-audio" controls style="width:100%;">'
-        f'<source src="data:{mime_type};base64,{b64_data}" type="{mime_type}">'
-        '</audio></div>'
-    )
-    cues_parts = [
-        '<div id="subtitle-container" style="height:500px; overflow-y:auto; border:1px solid #ccc; '
-        'padding:10px; border-radius:5px; background-color:#fff;">'
-    ]
-    for i, seg in enumerate(segments):
-        safe_text = html.escape(seg["text"])
-        cues_parts.append(
-            f'<div class="subtitle-row" data-index="{i}" data-start="{seg["start"]}" data-end="{seg["end"]}" '
-            f'style="padding:10px; margin:5px 0; border-radius:5px; border-bottom:1px solid #eee; '
-            f'cursor:pointer; display:flex; align-items:flex-start;">'
-            f'<span style="color:#666; font-size:0.85em; margin-right:15px; font-family:monospace; '
-            f'background:#eee; padding:2px 6px; border-radius:4px; min-width:60px; text-align:center;">'
-            f'{seg["start"]:.2f}s</span>'
-            f'<span class="text-content" style="font-size:1.1rem; color:#333; line-height:1.5;">{safe_text}</span>'
-            f'</div>'
-        )
-    cues_parts.append('</div>')
-    cues_html = "\n".join(cues_parts)
-    js_script = """
-<script>
-(function() {
-    let audio = document.getElementById("preview-audio");
-    let container = document.getElementById("subtitle-container");
-    if (!audio || !container) return;
-    let rows = container.querySelectorAll(".subtitle-row");
-    let clickBound = false;
-    function updateHighlight() {
-        let currentTime = audio.currentTime;
-        rows.forEach(row => {
-            let start = parseFloat(row.getAttribute("data-start"));
-            let end = parseFloat(row.getAttribute("data-end"));
-            if (currentTime >= start && currentTime < end) {
-                if (!row.classList.contains("active")) {
-                    row.classList.add("active");
-                    row.style.backgroundColor = "#e3f2fd";
-                    row.style.borderLeft = "5px solid #2196f3";
-                    row.style.fontWeight = "bold";
-                    row.style.transform = "scale(1.01)";
-                    row.style.boxShadow = "0 2px 5px rgba(0,0,0,0.1)";
-                    row.scrollIntoView({ behavior: "smooth", block: "center" });
-                }
-            } else {
-                if (row.classList.contains("active")) {
-                    row.classList.remove("active");
-                    row.style.backgroundColor = "";
-                    row.style.borderLeft = "";
-                    row.style.fontWeight = "";
-                    row.style.transform = "";
-                    row.style.boxShadow = "";
-                }
-            }
-        });
-    }
-    if (!clickBound) {
-        rows.forEach(row => {
-            row.onclick = function() {
-                let start = parseFloat(row.getAttribute("data-start"));
-                audio.currentTime = start;
-                audio.play();
-            };
-        });
-        clickBound = true;
-    }
-    audio.addEventListener("timeupdate", updateHighlight);
-    setTimeout(updateHighlight, 100);
-})();
-</script>
-"""
-    return audio_html + cues_html + js_script
+        ffprobe = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+        if not os.path.exists(ffprobe):
+            ffprobe = shutil.which("ffprobe") or "ffprobe"
+        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        data, sr = sf.read(audio_path)
+        return len(data) / sr
+    except Exception:
+        return None
 
-def save_outputs(base_name, full_text, timestamps_json, srt_text, language, model_info):
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    if base_name:
-        safe = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', Path(base_name).stem)
-        prefix = f"{safe}_{timestamp}"
-    else:
-        prefix = f"whisperx_{timestamp}"
-    saved = {}
-    txt_path = OUTPUT_DIR / f"{prefix}.txt"
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write(full_text)
-    saved['txt'] = str(txt_path)
-    if timestamps_json and timestamps_json != "{}":
-        json_path = OUTPUT_DIR / f"{prefix}.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            f.write(timestamps_json)
-        saved['json'] = str(json_path)
-    if srt_text.strip():
-        srt_path = OUTPUT_DIR / f"{prefix}.srt"
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            f.write(srt_text)
-        saved['srt'] = str(srt_path)
-    return saved
-
-def get_system_info(align_model_info: str = ""):
-    info = []
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(0) / 1e9
-        info.append(f"显卡: {gpu_name} ({total:.1f} GB)")
-        info.append(f"已分配显存: {allocated:.1f} GB")
-    else:
-        info.append("设备: CPU模式")
-    with manager.lock:
-        if manager.asr_model:
-            info.append(f"ASR模型: {manager.current_asr_model_name}")
-            info.append(f"计算类型: {manager.current_compute_type}")
-        else:
-            info.append("ASR模型: 未加载")
-        info.append(f"输出目录: {OUTPUT_DIR}")
-        info.append(f"打轴输出: {ALIGN_OUTPUT_DIR}")
-        if align_model_info:
-            info.append(f"对齐模型: {align_model_info}")
-    return "\n".join(info)
-
-def generate_output_filename(base_input, timestamp_str, custom_suffix="", default_name="recording"):
-    original_name = None
-    if isinstance(base_input, str) and os.path.exists(base_input):
-        original_name = Path(base_input).stem
-    elif isinstance(base_input, dict) and base_input.get('path') and os.path.exists(base_input['path']):
-        original_name = Path(base_input['path']).stem
-    elif isinstance(base_input, tuple):
-        original_name = default_name
-    if not original_name:
-        original_name = default_name
-    safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '', original_name)
-    if not safe_name:
-        safe_name = default_name
-    parts = [safe_name, timestamp_str]
-    if custom_suffix:
-        parts.append(custom_suffix)
-    return "_".join(parts)
-
-# ==================== 语言到对齐模型的映射表 ====================
-LANGUAGE_ALIGN_MODEL_MAP = {
-    "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
-    "en": "jonatasgrosman/wav2vec2-large-xlsr-53-english",
-    "fr": "jonatasgrosman/wav2vec2-large-xlsr-53-french",
-    "de": "jonatasgrosman/wav2vec2-large-xlsr-53-german",
-    "it": "jonatasgrosman/wav2vec2-large-xlsr-53-italian",
-    "es": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish",
-    "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
-    "ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
-    "nl": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
-    "hu": "jonatasgrosman/wav2vec2-large-xlsr-53-hungarian",
-}
-
-def get_align_model_from_language(language: str, local_models: List[Tuple[str, str]]) -> Tuple[Optional[str], bool]:
-    if not language:
-        return None, False
-    lang = language.strip().lower()
-    if lang in LANGUAGE_ALIGN_MODEL_MAP:
-        online_id = LANGUAGE_ALIGN_MODEL_MAP[lang]
-        for display, path in local_models:
-            if online_id.split("/")[-1].replace("-", "") in display.replace("-", "").replace("_", "").lower():
-                return path, True
-        return online_id, False
-    return None, False
+def extract_words_from_result(result, align_granularity, use_whisperx_align):
+    """提取单词/字符时间戳（已优化）"""
+    words = []
+    for seg in result.get("segments", []):
+        if "words" not in seg or not seg["words"]:
+            continue
+        seg_words = seg["words"]
+        for i, w in enumerate(seg_words):
+            if use_whisperx_align and align_granularity == "char" and "chars" in w:
+                chars_list = w["chars"]
+                valid_chars = [c for c in chars_list if "char" in c]
+                if not valid_chars:
+                    words.append({"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)})
+                    continue
+                all_have_time = all("start" in c and "end" in c for c in valid_chars)
+                if all_have_time:
+                    for c in valid_chars:
+                        words.append({"word": c["char"], "start": c["start"], "end": c["end"]})
+                else:
+                    word_dur = w["end"] - w["start"]
+                    char_dur = word_dur / len(valid_chars) if len(valid_chars) > 0 else word_dur
+                    for idx, c in enumerate(valid_chars):
+                        c_start = w["start"] + idx * char_dur
+                        c_end = c_start + char_dur
+                        words.append({"word": c["char"], "start": c_start, "end": c_end})
+            else:
+                if "start" in w and "end" in w and "word" in w:
+                    words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
+                else:
+                    prev_word = seg_words[i - 1] if i > 0 else None
+                    next_word = seg_words[i + 1] if i < len(seg_words) - 1 else None
+                    start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
+                    end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start + 0.01)
+                    word_text = w.get("word", "")
+                    if word_text:
+                        words.append({"word": word_text, "start": start, "end": end})
+    return words
 
 # ==================== 模型管理器 ====================
 class WhisperXManager:
@@ -512,6 +665,7 @@ class WhisperXManager:
         self.settings = load_settings()
         self.temp_files = []
         self.lock = threading.RLock()
+        self.keep_align_model_loaded = False
 
     def get_available_local_models(self):
         models = []
@@ -596,6 +750,8 @@ class WhisperXManager:
     def load_align_model(self, language_code: str, device: str, model_name: str = None, model_dir: str = None):
         if not WHISPERX_ALIGN_AVAILABLE:
             raise RuntimeError("whisperx.align 模块不可用")
+        if self.align_model is not None and self.keep_align_model_loaded:
+            return self.align_model, self.align_metadata
         self.unload_align_model()
         self.align_model, self.align_metadata = load_align_model(
             language_code=language_code,
@@ -606,7 +762,7 @@ class WhisperXManager:
         return self.align_model, self.align_metadata
 
     def unload_align_model(self):
-        if self.align_model is not None:
+        if self.align_model is not None and not self.keep_align_model_loaded:
             del self.align_model
             self.align_model = None
             self.align_metadata = None
@@ -691,6 +847,7 @@ class WhisperXManager:
         return cleaned
 
     def _prepare_audio(self, audio_input):
+        """音频预处理（修复整数归一化问题）"""
         try:
             if isinstance(audio_input, str) and os.path.exists(audio_input):
                 return audio_input
@@ -701,15 +858,17 @@ class WhisperXManager:
                 if data.ndim > 1:
                     data = np.mean(data, axis=1)
                 if np.issubdtype(data.dtype, np.integer):
+                    # 标准整数转浮点归一化
+                    bit_depth = np.iinfo(data.dtype).max
+                    data = data.astype(np.float32) / bit_depth
+                else:
                     data = data.astype(np.float32)
+                # 防止异常值
+                data = np.nan_to_num(data, nan=0.0, posinf=1.0, neginf=-1.0)
                 max_val = np.abs(data).max()
                 if max_val > 0:
                     data = data / max_val
-                else:
-                    data = data.astype(np.float32)
                 data = np.clip(data, -1.0, 1.0)
-                if np.any(np.isnan(data)) or np.any(np.isinf(data)):
-                    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
                 if sr != 16000:
                     data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                     sr = 16000
@@ -722,7 +881,6 @@ class WhisperXManager:
             return None
         except Exception as e:
             print(f"音频转换失败: {e}")
-            import traceback
             traceback.print_exc()
             return None
 
@@ -735,6 +893,207 @@ def ensure_model_loaded(model_size, device, compute_type, language, progress=Non
         raise RuntimeError(msg)
     return manager
 
+def format_result_to_outputs(result):
+    if not result or not isinstance(result, dict):
+        return "无结果", "{}", "", []
+    text = " ".join([seg["text"] for seg in result.get("segments", [])])
+    segments = result.get("segments", [])
+    timestamps_json = json.dumps(segments, ensure_ascii=False, indent=2)
+    srt_lines = []
+    for i, seg in enumerate(segments, 1):
+        start = seconds_to_srt_time(seg["start"])
+        end = seconds_to_srt_time(seg["end"])
+        srt_lines.append(str(i))
+        srt_lines.append(f"{start} --> {end}")
+        srt_lines.append(seg["text"])
+        srt_lines.append("")
+    srt_text = "\n".join(srt_lines)
+    extra = f"语言: {result.get('language', '未知')} (概率: {result.get('language_probability', 0):.2f})"
+    full_text = f"{text}\n[元数据] {extra}"
+    return full_text, timestamps_json, srt_text, segments
+
+def generate_subtitle_html(segments, audio_path, max_size_mb=5):
+    if not audio_path or not os.path.exists(audio_path) or not segments:
+        return '<div style="padding:20px; text-align:center; color:#999;">暂无字幕预览</div>'
+    try:
+        size = os.path.getsize(audio_path) / (1024 * 1024)
+        if size > max_size_mb:
+            return (f'<div style="padding:20px; text-align:center; color:#666;">'
+                    f'[提示] 音频文件过大 ({size:.1f} MB)，超过 {max_size_mb} MB 预览限制。</div>')
+    except:
+        pass
+    mime_map = {
+        '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
+        '.flac': 'audio/flac', '.ogg': 'audio/ogg', '.aac': 'audio/aac'
+    }
+    ext = os.path.splitext(audio_path)[1].lower()
+    mime_type = mime_map.get(ext, 'audio/wav')
+    try:
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        b64_data = base64.b64encode(audio_data).decode('utf-8')
+    except Exception as e:
+        return f'<div style="color:red;">音频加载失败: {e}</div>'
+    audio_html = ('<div style="margin-bottom:15px; padding:15px; background:#f8f9fa; border-radius:8px; border:1px solid #ddd;">'
+                  '<div style="margin-bottom:8px; font-weight:bold; color:#333;">音频回放</div>'
+                  '<audio id="preview-audio" controls style="width:100%;">'
+                  f'<source src="data:{mime_type};base64,{b64_data}" type="{mime_type}">'
+                  '</audio></div>')
+    cues_parts = ['<div id="subtitle-container" style="height:500px; overflow-y:auto; border:1px solid #ccc; '
+                  'padding:10px; border-radius:5px; background-color:#fff;">']
+    for i, seg in enumerate(segments):
+        safe_text = html.escape(seg["text"])
+        cues_parts.append(
+            f'<div class="subtitle-row" data-index="{i}" data-start="{seg["start"]}" data-end="{seg["end"]}" '
+            f'style="padding:10px; margin:5px 0; border-radius:5px; border-bottom:1px solid #eee; '
+            f'cursor:pointer; display:flex; align-items:flex-start;">'
+            f'<span style="color:#666; font-size:0.85em; margin-right:15px; font-family:monospace; '
+            f'background:#eee; padding:2px 6px; border-radius:4px; min-width:60px; text-align:center;">'
+            f'{seg["start"]:.2f}s</span>'
+            f'<span class="text-content" style="font-size:1.1rem; color:#333; line-height:1.5;">{safe_text}</span>'
+            f'</div>')
+    cues_parts.append('</div>')
+    js_script = """<script>
+(function() {
+    let audio = document.getElementById("preview-audio");
+    let container = document.getElementById("subtitle-container");
+    if (!audio || !container) return;
+    let rows = container.querySelectorAll(".subtitle-row");
+    let clickBound = false;
+    function updateHighlight() {
+        let currentTime = audio.currentTime;
+        rows.forEach(row => {
+            let start = parseFloat(row.getAttribute("data-start"));
+            let end = parseFloat(row.getAttribute("data-end"));
+            if (currentTime >= start && currentTime < end) {
+                if (!row.classList.contains("active")) {
+                    row.classList.add("active");
+                    row.style.backgroundColor = "#e3f2fd";
+                    row.style.borderLeft = "5px solid #2196f3";
+                    row.style.fontWeight = "bold";
+                    row.style.transform = "scale(1.01)";
+                    row.style.boxShadow = "0 2px 5px rgba(0,0,0,0.1)";
+                    row.scrollIntoView({ behavior: "smooth", block: "center" });
+                }
+            } else {
+                if (row.classList.contains("active")) {
+                    row.classList.remove("active");
+                    row.style.backgroundColor = "";
+                    row.style.borderLeft = "";
+                    row.style.fontWeight = "";
+                    row.style.transform = "";
+                    row.style.boxShadow = "";
+                }
+            }
+        });
+    }
+    if (!clickBound) {
+        rows.forEach(row => {
+            row.onclick = function() {
+                let start = parseFloat(row.getAttribute("data-start"));
+                audio.currentTime = start;
+                audio.play();
+            };
+        });
+        clickBound = true;
+    }
+    audio.addEventListener("timeupdate", updateHighlight);
+    setTimeout(updateHighlight, 100);
+})();
+</script>"""
+    return audio_html + "\n".join(cues_parts) + js_script
+
+def save_outputs(base_name, full_text, timestamps_json, srt_text, language, model_info):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if base_name:
+        safe = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', Path(base_name).stem)
+        prefix = f"{safe}_{timestamp}"
+    else:
+        prefix = f"whisperx_{timestamp}"
+    saved = {}
+    txt_path = OUTPUT_DIR / f"{prefix}.txt"
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(full_text)
+    saved['txt'] = str(txt_path)
+    if timestamps_json and timestamps_json != "{}":
+        json_path = OUTPUT_DIR / f"{prefix}.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            f.write(timestamps_json)
+        saved['json'] = str(json_path)
+    if srt_text.strip():
+        srt_path = OUTPUT_DIR / f"{prefix}.srt"
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            f.write(srt_text)
+        saved['srt'] = str(srt_path)
+    return saved
+
+def generate_output_filename(base_input, timestamp_str, custom_suffix="", default_name="recording"):
+    original_name = None
+    if isinstance(base_input, str) and os.path.exists(base_input):
+        original_name = Path(base_input).stem
+    elif isinstance(base_input, dict) and base_input.get('path') and os.path.exists(base_input['path']):
+        original_name = Path(base_input['path']).stem
+    elif isinstance(base_input, tuple):
+        original_name = default_name
+    if not original_name:
+        original_name = default_name
+    safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '', original_name)
+    if not safe_name:
+        safe_name = default_name
+    parts = [safe_name, timestamp_str]
+    if custom_suffix:
+        parts.append(custom_suffix)
+    return "_".join(parts)
+
+def get_system_info(align_model_info: str = ""):
+    info = []
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        allocated = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
+        info.append(f"显卡: {gpu_name} ({total:.1f} GB)")
+        info.append(f"已分配显存: {allocated:.1f} GB")
+    else:
+        info.append("设备: CPU模式")
+    with manager.lock:
+        if manager.asr_model:
+            info.append(f"ASR模型: {manager.current_asr_model_name}")
+            info.append(f"计算类型: {manager.current_compute_type}")
+        else:
+            info.append("ASR模型: 未加载")
+        info.append(f"输出目录: {OUTPUT_DIR}")
+        info.append(f"打轴输出: {ALIGN_OUTPUT_DIR}")
+        if align_model_info:
+            info.append(f"对齐模型: {align_model_info}")
+    return "\n".join(info)
+
+# ==================== 语言到对齐模型的映射表 ====================
+LANGUAGE_ALIGN_MODEL_MAP = {
+    "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+    "en": "jonatasgrosman/wav2vec2-large-xlsr-53-english",
+    "fr": "jonatasgrosman/wav2vec2-large-xlsr-53-french",
+    "de": "jonatasgrosman/wav2vec2-large-xlsr-53-german",
+    "it": "jonatasgrosman/wav2vec2-large-xlsr-53-italian",
+    "es": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish",
+    "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
+    "ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
+    "nl": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
+    "hu": "jonatasgrosman/wav2vec2-large-xlsr-53-hungarian",
+}
+
+def get_align_model_from_language(language: str, local_models: List[Tuple[str, str]]) -> Tuple[Optional[str], bool]:
+    if not language:
+        return None, False
+    lang = language.strip().lower()
+    if lang in LANGUAGE_ALIGN_MODEL_MAP:
+        online_id = LANGUAGE_ALIGN_MODEL_MAP[lang]
+        for display, path in local_models:
+            if online_id.split("/")[-1].replace("-", "") in display.replace("-", "").replace("_", "").lower():
+                return path, True
+        return online_id, False
+    return None, False
+
+# ==================== 转写相关函数 ====================
 def transcribe_audio(audio, model_size, device, compute_type, language, beam_size, vad_filter,
                      hotwords, progress=gr.Progress()):
     if audio is None:
@@ -783,6 +1142,7 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
 def transcribe_video(video, model_size, device, compute_type, language, beam_size, vad_filter,
                      subtitle_mode, hotwords, progress=gr.Progress()):
     temp_audio_path = None
+    temp_srt_path = None
     try:
         if video is None:
             return "请上传视频文件", "", ""
@@ -819,8 +1179,7 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             save_info += f" {Path(saved['srt']).name}\n"
         srt_path = saved.get('srt')
         if not srt_path:
-            result_msg = f"处理完成，但未生成字幕（可能音频无语音）。\n{save_info}"
-            return result_msg, "", ""
+            return f"处理完成，但未生成字幕（可能音频无语音）。\n{save_info}", "", ""
         progress(0.8, desc="嵌入字幕...")
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
         prefix = generate_output_filename(video, timestamp_str, subtitle_mode, default_name="video")
@@ -833,11 +1192,14 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
                    "-c", "copy", "-c:s", "mov_text",
                    "-metadata:s:s:0", "language=chi", "-y", out_path_str]
         else:
-            # Windows 路径转义修复
-            safe_srt = srt_path_str.replace(":", "\\:").replace("'", r"\'")
+            # 硬字幕：为避免路径特殊字符，将字幕复制到简单临时文件
+            temp_srt = tempfile.NamedTemporaryFile(delete=False, suffix=".srt", mode='w', encoding='utf-8')
+            temp_srt.write(srt_text)
+            temp_srt.close()
+            temp_srt_path = temp_srt.name
+            safe_srt = temp_srt_path.replace('\\', '/')
             vf = f"subtitles='{safe_srt}':force_style='FontName=Microsoft YaHei,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'"
-            cmd = [FFMPEG_PATH, "-i", video_path_str,
-                   "-vf", vf,
+            cmd = [FFMPEG_PATH, "-i", video_path_str, "-vf", vf,
                    "-c:a", "copy", "-y", out_path_str]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         result_msg = f"处理完成！\n输出视频: {out_path.name}\n{save_info}"
@@ -851,6 +1213,11 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)
+            except:
+                pass
+        if temp_srt_path and os.path.exists(temp_srt_path):
+            try:
+                os.unlink(temp_srt_path)
             except:
                 pass
         manager.cleanup_temp()
@@ -899,6 +1266,7 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
             manager.cleanup_temp()
     return "\n".join(results_text)
 
+# ==================== 强制对齐（字幕自动打轴） ====================
 def force_align_wrapper(
     audio, reference_text, model_size, device, compute_type, language, beam_size, vad_filter,
     align_granularity, hotwords,
@@ -912,11 +1280,13 @@ def force_align_wrapper(
         return "请上传音频文件", "", "", get_system_info()
     if not reference_text.strip():
         return "请粘贴稿子文本", "", "", get_system_info()
+
     # ---- 1. 确定对齐模型 ----
     local_align_models = manager.get_local_align_models()
     align_model_path = None
     align_model_display = "默认（简单算法）"
     use_whisperx_align = False
+
     if auto_match_align and language:
         model_info, is_local = get_align_model_from_language(language, local_align_models)
         if model_info:
@@ -943,17 +1313,21 @@ def force_align_wrapper(
             use_whisperx_align = WHISPERX_ALIGN_AVAILABLE
             align_model_path = None
             align_model_display = "默认（WhisperX自动选择）" if use_whisperx_align else "默认（简单算法）"
+
     status_text = get_system_info(align_model_display)
+
     # ---- 2. 加载ASR模型并转写 ----
     progress(0.1, desc="加载ASR模型...")
     try:
         ensure_model_loaded(model_size, device, compute_type, language, progress)
     except RuntimeError as e:
         return str(e), "", "", status_text
+
     progress(0.3, desc="转写音频...")
     audio_path = manager._prepare_audio(audio)
     if not audio_path:
         return "音频处理失败", "", "", status_text
+
     try:
         result, err = manager.transcribe_with_segments(
             audio_path, language, beam_size, vad_filter,
@@ -961,13 +1335,16 @@ def force_align_wrapper(
         )
         if err:
             return f"转写失败: {err}", "", "", status_text
+
+        original_result = copy.deepcopy(result)
+
         # ---- 3. 精细对齐（如果可用） ----
         if use_whisperx_align:
             progress(0.6, desc=f"加载对齐模型: {align_model_display}...")
             try:
                 model_name_for_align = align_model_path
                 model_dir_for_align = str(ROOT_DIR / "pretrained_models")
-                if align_model_choice == "无（使用默认）" and auto_match_align == False:
+                if align_model_choice == "无（使用默认）" and not auto_match_align:
                     model_name_for_align = None
                 align_model, align_metadata = manager.load_align_model(
                     language_code=language or result.get("language", "en"),
@@ -985,102 +1362,68 @@ def force_align_wrapper(
                     return_char_alignments=(align_granularity == "char")
                 )
                 result = aligned_result
-                manager.unload_align_model()
+                if not manager.keep_align_model_loaded:
+                    manager.unload_align_model()
             except Exception as e:
                 progress(0.7, desc="对齐失败，回退到简单算法")
                 print(f"警告: whisperx.align 执行失败，将使用简单对齐算法。错误: {e}")
-                manager.unload_align_model()
+                if not manager.keep_align_model_loaded:
+                    manager.unload_align_model()
                 use_whisperx_align = False
-        # ---- 4. 提取单词/字符时间戳（已修复） ----
-        words = []
-        for seg in result.get("segments", []):
-            if "words" not in seg or not seg["words"]:
-                continue
-            seg_words = seg["words"]
-            for i, w in enumerate(seg_words):
-                if use_whisperx_align and align_granularity == "char" and "chars" in w:
-                    for c in w["chars"]:
-                        if "char" in c and "start" in c and "end" in c:
-                            words.append({"word": c["char"], "start": c["start"], "end": c["end"]})
-                        else:
-                            char_text = c.get("char", "")
-                            if char_text:
-                                words.append({"word": char_text, "start": w.get("start", 0.0), "end": w.get("end", 0.0)})
-                else:
-                    if "start" in w and "end" in w and "word" in w:
-                        words.append({"word": w["word"], "start": w["start"], "end": w["end"]})
-                    else:
-                        prev_word = seg_words[i-1] if i > 0 else None
-                        next_word = seg_words[i+1] if i < len(seg_words)-1 else None
-                        start = prev_word["end"] if prev_word and "end" in prev_word else seg.get("start", 0.0)
-                        end = next_word["start"] if next_word and "start" in next_word else seg.get("end", start+0.01)
-                        word_text = w.get("word", "")
-                        if word_text:
-                            words.append({"word": word_text, "start": start, "end": end})
+                result = original_result
+
+        # ---- 4. 提取单词/字符时间戳 ----
+        words = extract_words_from_result(result, align_granularity, use_whisperx_align)
         if not words:
             return "错误: 未检测到有效的单词时间戳", "", "", status_text
-        # ---- 5. 文稿匹配 ----
+
+        # ---- 5. 文稿规范化与对齐 ----
         progress(0.8, desc="匹配文稿...")
-        try:
-            duration = sf.info(audio_path).duration
-        except Exception:
-            duration = None
+        duration = get_audio_duration_robust(audio_path)
+        normalized_text = normalize_text_for_alignment(reference_text, align_granularity)
+
         if align_granularity == "char":
-            aligned = force_align_char_level(reference_text, words, duration)
+            aligned = force_align_char_level(normalized_text, words, duration)
         else:
-            aligned = force_align_word_level(reference_text, words, duration)
+            aligned = force_align_word_level(normalized_text, words, duration)
+
         if not aligned:
             return "对齐失败，请检查稿子与音频是否匹配", "", "", status_text
+
         # ---- 6. 生成字幕 ----
         word_srt = words_to_srt(aligned)
+
         paragraphs = re.split(r'\n\s*\n', reference_text.strip())
         paragraphs = [p.strip() for p in paragraphs if p.strip()]
-        char_pos = 0
-        sentences = []
+        if not paragraphs:
+            return "主文稿无有效段落", "", "", status_text
+
+        norm_paragraphs = [normalize_text_for_alignment(p, align_granularity) for p in paragraphs]
+
         if align_granularity == "char":
-            for para in paragraphs:
-                para_char_count = len([ch for ch in para if ch.strip()])
-                start_idx = char_pos
-                end_idx = char_pos + para_char_count
-                if start_idx >= len(aligned):
-                    break
-                if end_idx > len(aligned):
-                    end_idx = len(aligned)
-                seg_words = aligned[start_idx:end_idx]
-                if seg_words:
-                    sentences.append({
-                        "start": seg_words[0]["start"],
-                        "end": seg_words[-1]["end"],
-                        "text": "".join([w["word"] for w in seg_words])
-                    })
-                char_pos = end_idx
+            sentences = match_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
         else:
-            word_idx = 0
-            for para in paragraphs:
-                para_words = para.split()
-                para_word_count = len(para_words)
-                start_idx = word_idx
-                end_idx = word_idx + para_word_count
-                if start_idx >= len(aligned):
-                    break
-                if end_idx > len(aligned):
-                    end_idx = len(aligned)
-                seg_words = aligned[start_idx:end_idx]
-                if seg_words:
-                    sentences.append({
-                        "start": seg_words[0]["start"],
-                        "end": seg_words[-1]["end"],
-                        "text": " ".join([w["word"] for w in seg_words])
-                    })
-                word_idx = end_idx
+            sentences = match_word_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
+
         sent_srt = sentences_to_srt(sentences)
-        merged_srt = _generate_merged_srt(
-            aligned, sentences, paragraphs,
-            merge_punctuations, merge_max_words, merge_max_chars,
-            merge_max_duration, merge_by_newline,
-            merge_by_punc, merge_by_silence, merge_by_wordcount,
-            merge_by_charcount, merge_by_duration, merge_silence_threshold
+        merged_srt = generate_merged_srt(
+            aligned_chars=aligned,
+            sentences=sentences,
+            paragraphs=paragraphs,
+            merge_punctuations=merge_punctuations,
+            merge_max_words=merge_max_words,
+            merge_max_chars=merge_max_chars,
+            merge_max_duration=merge_max_duration,
+            merge_by_newline=merge_by_newline,
+            merge_by_punc=merge_by_punc,
+            merge_by_silence=merge_by_silence,
+            merge_by_wordcount=merge_by_wordcount,
+            merge_by_charcount=merge_by_charcount,
+            merge_by_duration=merge_by_duration,
+            silence_threshold=merge_silence_threshold,
+            align_granularity=align_granularity
         )
+
         # ---- 7. 保存文件 ----
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         prefix = f"align_{timestamp}"
@@ -1093,6 +1436,7 @@ def force_align_wrapper(
             f.write(sent_srt)
         with open(merged_path, "w", encoding="utf-8") as f:
             f.write(merged_srt)
+
         progress(1.0, desc="完成")
         return word_srt, sent_srt, merged_srt, status_text
     finally:
@@ -1174,7 +1518,6 @@ def create_interface():
                 unload_btn = gr.Button("卸载模型", variant="stop")
             with gr.Column(scale=1):
                 beam_size = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)
-                # VAD 默认关闭以避免离线下载问题
                 vad_filter = gr.Checkbox(label="启用 VAD 过滤", value=True)
         load_btn.click(load_model_click, inputs=[model_size, device, compute_type, language],
                        outputs=[status_display, status_display])
@@ -1549,12 +1892,21 @@ def cleanup():
 # ==================== 主函数 ====================
 def main():
     demo = create_interface()
-    demo.queue().launch(
-        server_name="127.0.0.1",
-        server_port=18006,
-        inbrowser=True,
-        show_error=True
-    )
+    # 端口自动重试
+    for port in [18006, 18007, 18008, 18009, 18010]:
+        try:
+            demo.queue().launch(
+                server_name="127.0.0.1",
+                server_port=port,
+                inbrowser=True,
+                show_error=True
+            )
+            break
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+            continue
+    else:
+        print("所有端口均被占用，请手动指定空闲端口。")
 
 if __name__ == "__main__":
     main()
