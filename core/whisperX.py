@@ -8,6 +8,7 @@ WhisperX 语音识别独立增强版（参数全开放 /稳定版）
 - VAD 高级参数（onset/offset/时长/静音间隔）
 - 界面显示最大字符数可调（默认5000，防前端崩溃）
 - 一键打开输出目录
+- 音频预处理（FFmpeg 16k mono）可控开关，避免内存溢出
 Copyright 2026 光影的故事2018
 """
 
@@ -18,7 +19,7 @@ from typing import List, Dict, Optional, Tuple, Set
 sys.setrecursionlimit(10000)
 
 # ==================== 日志 ====================
-LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR = Path(__file__).parent / "logs"  # 修复：日志目录改为脚本所在目录下
 LOG_DIR.mkdir(exist_ok=True)
 
 def clean_old_logs(days=7):
@@ -34,10 +35,14 @@ logger = logging.getLogger(__name__)
 
 # ==================== 路径 ====================
 CURRENT_DIR = Path(__file__).parent.absolute()
-PROJECT_ROOT = CURRENT_DIR.parent
+# 智能判断项目根：如果在子目录中，则上一级；否则就是当前目录
+if (CURRENT_DIR.parent / "pretrained_models").exists() or (CURRENT_DIR.parent / "preset").exists():
+    PROJECT_ROOT = CURRENT_DIR.parent
+else:
+    PROJECT_ROOT = CURRENT_DIR
 sys.path.insert(0, str(PROJECT_ROOT))
-BASE_DIR = Path(__file__).parent.absolute()
-ROOT_DIR = BASE_DIR.parent
+BASE_DIR = CURRENT_DIR
+ROOT_DIR = PROJECT_ROOT
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output"
 OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 PRESET_DIR = ROOT_DIR / "preset"
@@ -445,10 +450,13 @@ class WhisperXManager:
             align_model_path = None
             if model_choice == "auto":
                 detected = result.get("language", "en")
+                # 补全常用语言映射
                 lang_map = {
                     "zh": "chinese-zh-cn", "en": "english", "ja": "japanese",
                     "fr": "french", "de": "german", "es": "spanish",
-                    "pt": "portuguese", "it": "italian", "nl": "dutch", "hu": "hungarian"
+                    "pt": "portuguese", "it": "italian", "nl": "dutch", "hu": "hungarian",
+                    "ru": "russian", "pl": "polish", "vi": "vietnamese", "tr": "turkish",
+                    "ko": "korean", "ar": "arabic", "sv": "swedish", "uk": "ukrainian",
                 }
                 key = lang_map.get(detected.lower(), detected.lower())
                 for disp, path in local_align:
@@ -459,7 +467,22 @@ class WhisperXManager:
                     online_map = {
                         "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
                         "en": "jonatasgrosman/wav2vec2-large-xlsr-53-english",
-                        # 此处省略其他语言完整映射，实际保留原完整代码
+                        "ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
+                        "fr": "jonatasgrosman/wav2vec2-large-xlsr-53-french",
+                        "de": "jonatasgrosman/wav2vec2-large-xlsr-53-german",
+                        "es": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish",
+                        "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
+                        "it": "jonatasgrosman/wav2vec2-large-xlsr-53-italian",
+                        "nl": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
+                        "hu": "jonatasgrosman/wav2vec2-large-xlsr-53-hungarian",
+                        "ru": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
+                        "pl": "jonatasgrosman/wav2vec2-large-xlsr-53-polish",
+                        "vi": "jonatasgrosman/wav2vec2-large-xlsr-53-vietnamese",
+                        "tr": "jonatasgrosman/wav2vec2-large-xlsr-53-turkish",
+                        "ko": "jonatasgrosman/wav2vec2-large-xlsr-53-korean",
+                        "ar": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic",
+                        "sv": "jonatasgrosman/wav2vec2-large-xlsr-53-swedish",
+                        "uk": "jonatasgrosman/wav2vec2-large-xlsr-53-ukrainian",
                     }
                     align_model_path = online_map.get(detected.lower())
                     if not align_model_path:
@@ -513,28 +536,41 @@ class WhisperXManager:
             except: pass
         return cleaned
 
-    def _prepare_audio(self, audio_input):
-        try:
-            if isinstance(audio_input, str) and os.path.exists(audio_input):
+    def _prepare_audio(self, audio_input, force_preprocess=False):
+        """
+        返回用于转写的音频路径（16kHz mono）
+        - force_preprocess=True: 总是用FFmpeg重采样为16k单声道
+        - 否则直接返回原有路径
+        """
+        if isinstance(audio_input, str) and os.path.exists(audio_input):
+            if not force_preprocess:
                 return audio_input
-            if isinstance(audio_input, tuple) and len(audio_input)==2:
-                sr, data = audio_input
-                if data is None: return None
-                if data.ndim > 1: data = np.mean(data, axis=1)
-                if sr != 16000:
+            temp_16k = tempfile.mktemp(suffix="_16k_mono.wav")
+            cmd = [
+                FFMPEG_PATH, "-y", "-i", audio_input,
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                temp_16k
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.temp_files.append(temp_16k)
+            return temp_16k
+        # 如果收到 numpy 数组（旧版兼容，但不推荐）
+        if isinstance(audio_input, tuple) and len(audio_input)==2:
+            sr, data = audio_input
+            if data is None: return None
+            if data.ndim > 1: data = np.mean(data, axis=1)
+            if sr != 16000:
+                try:
                     from scipy import signal
                     n_samples = int(len(data) * 16000 / sr)
                     data = signal.resample(data, n_samples)
-                    sr = 16000
-                temp_hash = hashlib.md5(data.tobytes() + str(time.time()).encode()).hexdigest()[:8]
-                temp_path = os.path.join(tempfile.gettempdir(), f"whisperx_temp_{temp_hash}.wav")
-                sf.write(temp_path, data, sr)
-                self.temp_files.append(temp_path)
-                return temp_path
-            return None
-        except Exception as e:
-            print(f"音频转换失败: {e}")
-            return None
+                except ImportError:
+                    raise ImportError("需要 scipy 进行重采样，请安装 scipy")
+            temp_path = tempfile.mktemp(suffix=".wav")
+            sf.write(temp_path, data, 16000)
+            self.temp_files.append(temp_path)
+            return temp_path
+        return None
 
 manager = WhisperXManager()
 
@@ -547,13 +583,14 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
                      vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
                      hotwords, enable_align, align_model,
                      max_duration, max_chars, split_by_punc, punc_chars,
+                     force_preprocess,
                      progress=gr.Progress()):
-    if audio is None: return "请上传或录制音频", "", ""
+    if audio is None: return "请上传音频文件", "", ""
     progress(0, desc="初始化...")
     try: ensure_model_loaded(model_size, device, compute_type, language)
     except RuntimeError as e: return str(e), "", ""
-    progress(0.3, desc="转写中...")
-    audio_path = manager._prepare_audio(audio)
+    progress(0.2, desc="预处理音频...")
+    audio_path = manager._prepare_audio(audio, force_preprocess=force_preprocess)
     if not audio_path: return "音频处理失败", "", ""
     try:
         prompt = hotwords.strip() if hotwords else None
@@ -636,13 +673,15 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         ts = time.strftime("%Y%m%d_%H%M%S")
         prefix = generate_output_filename(video, ts, subtitle_mode, "video")
         out_path = OUTPUT_DIR / f"{prefix}.mp4"
-        srt_str = str(srt_path).replace('\\','/')
-        vid_str = str(video).replace('\\','/')
-        out_str = str(out_path).replace('\\','/')
+        # 安全转义路径中的单引号，避免FFmpeg解析错误
+        srt_str = str(srt_path).replace('\\', '/')
+        escaped_srt = srt_str.replace("'", "'\\''")
+        vid_str = str(video).replace('\\', '/')
+        out_str = str(out_path).replace('\\', '/')
         if subtitle_mode == "soft":
             cmd = [FFMPEG_PATH, "-i", vid_str, "-i", srt_str, "-c", "copy", "-c:s", "mov_text", "-metadata:s:s:0", "language=chi", "-y", out_str]
         else:
-            cmd = [FFMPEG_PATH, "-i", vid_str, "-vf", f"subtitles='{srt_str}':force_style='FontName=Microsoft YaHei,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'", "-c:a", "copy", "-y", out_str]
+            cmd = [FFMPEG_PATH, "-i", vid_str, "-vf", f"subtitles='{escaped_srt}':force_style='FontName=Microsoft YaHei,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'", "-c:a", "copy", "-y", out_str]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         result_msg = f"✅ 处理完成！输出视频: {out_path.name}\n字幕文件已保存至 output 目录。"
         progress(1.0, desc="完成")
@@ -660,6 +699,7 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
                      vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
                      hotwords, enable_align, align_model,
                      max_duration, max_chars, split_by_punc, punc_chars,
+                     force_preprocess,
                      progress=gr.Progress()):
     if not files: return "请选择音频文件"
     try: ensure_model_loaded(model_size, device, compute_type, language)
@@ -668,7 +708,7 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
     for i, fobj in enumerate(files, 1):
         fp = fobj.name if hasattr(fobj, 'name') else str(fobj)
         progress(i/total, desc=f"处理 {i}/{total}: {os.path.basename(fp)}")
-        ap = manager._prepare_audio(fp)
+        ap = manager._prepare_audio(fp, force_preprocess=force_preprocess)
         if not ap: continue
         try:
             prompt = hotwords.strip() if hotwords else None
@@ -697,11 +737,14 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
 
 def load_model_click(model_size, device, compute_type, language):
     success, msg = manager.load_asr_model(model_size, device, compute_type, language)
-    return msg, get_system_info()
+    info = get_system_info()
+    return msg + "\n" + info
 
 def unload_model_click():
     manager.unload_models()
-    return "模型已卸载", get_system_info()
+    msg = "模型已卸载"
+    info = get_system_info()
+    return msg + "\n" + info
 
 def refresh_status(): return get_system_info()
 
@@ -756,8 +799,8 @@ def create_interface():
             with gr.Row():
                 open_output_btn = gr.Button("打开输出目录", variant="secondary")
 
-        load_btn.click(load_model_click, inputs=[model_size, device, compute_type, language], outputs=[status_display_ctrl, status_display_ctrl])
-        unload_btn.click(unload_model_click, outputs=[status_display_ctrl, status_display_ctrl])
+        load_btn.click(load_model_click, inputs=[model_size, device, compute_type, language], outputs=[status_display_ctrl])
+        unload_btn.click(unload_model_click, outputs=[status_display_ctrl])
         refresh_btn.click(refresh_status, outputs=[status_display_ctrl])
         health_btn.click(health_check, outputs=[status_display_ctrl])
         open_output_btn.click(open_output_folder, inputs=None, outputs=None)
@@ -769,7 +812,13 @@ def create_interface():
             with gr.Tab("音频识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        audio_input = gr.Audio(label="选择或录制音频", type="numpy", sources=["upload","microphone"])
+                        audio_input = gr.File(
+                            label="选择音频文件",
+                            file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"]
+                        )
+                        force_preprocess_check = gr.Checkbox(
+                            label="⚡ 强制预处理为 16kHz 单声道 (推荐大文件)", value=True
+                        )
                         hotwords_audio = gr.Textbox(label="热词/提示词", lines=2, value="")
                         with gr.Accordion("断句控制", open=False):
                             max_dur_audio = gr.Slider(label="最长单句时长 (秒)", minimum=5, maximum=60, value=15, step=1)
@@ -797,7 +846,8 @@ def create_interface():
                     inputs=[audio_input, model_size, device, compute_type, language, beam_size,
                             vad_enable_audio, vad_threshold_audio, vad_min_speech_audio, vad_min_silence_audio,
                             hotwords_audio, enable_align_audio, align_model_audio,
-                            max_dur_audio, max_chars_audio, split_punc_audio, punc_chars_audio],
+                            max_dur_audio, max_chars_audio, split_punc_audio, punc_chars_audio,
+                            force_preprocess_check],
                     outputs=[text_out, json_out, srt_out]
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 c_btn.click(lambda: [None, "", "", "", ""], outputs=[audio_input, hotwords_audio, text_out, json_out, srt_out])
@@ -845,6 +895,9 @@ def create_interface():
                 with gr.Row():
                     with gr.Column(scale=1):
                         files_input = gr.Files(label="上传多个音频", file_types=[".wav",".mp3",".m4a",".flac",".ogg"], file_count="multiple")
+                        force_preprocess_batch = gr.Checkbox(
+                            label="⚡ 强制预处理为 16kHz 单声道", value=True
+                        )
                         hotwords_batch = gr.Textbox(label="热词/提示词", lines=2, value="")
                         with gr.Accordion("断句控制", open=False):
                             max_dur_batch = gr.Slider(label="最长单句时长 (秒)", minimum=5, maximum=60, value=15, step=1)
@@ -870,7 +923,8 @@ def create_interface():
                     inputs=[files_input, model_size, device, compute_type, language, beam_size,
                             vad_enable_batch, vad_threshold_batch, vad_min_speech_batch, vad_min_silence_batch,
                             hotwords_batch, enable_align_batch, align_model_batch,
-                            max_dur_batch, max_chars_batch, split_punc_batch, punc_chars_batch],
+                            max_dur_batch, max_chars_batch, split_punc_batch, punc_chars_batch,
+                            force_preprocess_batch],
                     outputs=[batch_out]
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 bc_btn.click(lambda: [None, "", ""], outputs=[files_input, hotwords_batch, batch_out])
@@ -897,13 +951,20 @@ def main():
     demo = create_interface()
     for port in [18006,18007,18008,18009,18010]:
         try:
-            demo.queue().launch(server_name="127.0.0.1", server_port=port, inbrowser=True, show_error=True)
+            demo.queue().launch(
+                server_name="127.0.0.1",
+                server_port=port,
+                inbrowser=True,
+                show_error=True,
+                max_file_size=500 * 1024 * 1024  # 500MB
+            )
             break
         except OSError:
             print(f"端口 {port} 被占用，尝试下一个...")
             continue
     else:
         print("所有端口均被占用，请手动指定空闲端口。")
+        sys.exit(1)  # 明确返回错误码
 
 if __name__ == "__main__":
     main()
