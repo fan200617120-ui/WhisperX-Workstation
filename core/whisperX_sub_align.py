@@ -7,6 +7,7 @@
 增强：本地模型扫描（文件夹名即模型名，与 whisperX.py 一致）
 新增：VAD 高级参数开放、输出截断保护、打开输出目录
 新增：音频预处理开关（FFmpeg 16k mono），避免大文件内存溢出
+新增：音频预览试听（只读）
 Copyright 2026 光影的故事2018
 """
 
@@ -61,6 +62,9 @@ def safe_text(text: str, max_len: int = None) -> str:
     if not text:
         return ""
     if len(text) > max_len:
+        # 对 SRT 等结构化文本进行特殊提示，避免破坏结构
+        if text.strip().startswith("1\n"):
+            return text[:max_len] + "\n\n[注意] 返回的字幕过长已截断，完整结果已保存至 output/字幕自动打轴 目录。"
         return text[:max_len] + "\n\n[注意] 返回内容过长已截断，完整结果已保存至 output/字幕自动打轴 目录。"
     return text
 
@@ -620,6 +624,7 @@ class AlignModelManager:
         self.compute_type = "int8_float32"
         self.align_model = None
         self.align_metadata = None
+        self.align_model_lang = None          # 记录当前对齐模型匹配的语言/模型参数
         self.lock = threading.RLock()
         self.keep_align_model_loaded = False
 
@@ -653,8 +658,13 @@ class AlignModelManager:
 
     def load_model(self, model_size, device, compute_type):
         with self.lock:
-            if self.model is not None and self.current_model_name == model_size:
+            # 检查缓存，必须同时匹配模型名、设备、计算类型
+            if (self.model is not None and
+                self.current_model_name == model_size and
+                self.device == device and
+                self.compute_type == compute_type):
                 return True, f"模型 {model_size} 已加载"
+
             local_models = self.get_local_models()
             model_path = None
             for disp, path in local_models:
@@ -725,20 +735,28 @@ class AlignModelManager:
         with self.lock:
             if not WHISPERX_ALIGN_AVAILABLE:
                 raise RuntimeError("whisperx.align 模块不可用")
-            if self.align_model is not None:
-                if not self.keep_align_model_loaded:
+
+            # 构造缓存键，用于判断是否已加载正确的模型
+            cache_key = f"{language_code}_{model_name}_{device}"
+            if self.keep_align_model_loaded and self.align_model is not None:
+                if self.align_model_lang == cache_key:
+                    return self.align_model, self.align_metadata
+                # 参数变化了，需要重新加载
+            if not self.keep_align_model_loaded:
+                # 显式卸载，避免内存堆积
+                if self.align_model is not None:
                     del self.align_model
                     self.align_model = None
                     self.align_metadata = None
                     self._clean_gpu_memory()
-                else:
-                    return self.align_model, self.align_metadata
+
             self.align_model, self.align_metadata = load_align_model(
                 language_code=language_code,
                 device=device,
                 model_name=model_name,
                 model_dir=model_dir,
             )
+            self.align_model_lang = cache_key
             return self.align_model, self.align_metadata
 
     def unload_align_model(self):
@@ -747,6 +765,7 @@ class AlignModelManager:
                 del self.align_model
                 self.align_model = None
                 self.align_metadata = None
+                self.align_model_lang = None
                 self._clean_gpu_memory()
 
     def unload_system(self):
@@ -836,7 +855,7 @@ def safe_audio_path(audio_input: Union[str, tuple, dict, None]) -> Optional[str]
     if isinstance(audio_input, tuple):
         return audio_input[0] if len(audio_input) > 0 else None
     if isinstance(audio_input, dict):
-        return audio_input.get("name")
+        return audio_input.get("name") or audio_input.get("path")
     return None
 
 # ==================== 核心对齐流程 ====================
@@ -849,7 +868,7 @@ def run_alignment(
     merge_silence_threshold, merge_by_punc, merge_by_silence,
     merge_by_wordcount, merge_by_charcount, merge_by_duration,
     merge_by_newline, keep_align_loaded,
-    force_preprocess,   # 新增：预处理开关
+    force_preprocess,
     progress=gr.Progress(),
 ):
     if audio_file is None:
@@ -859,15 +878,23 @@ def run_alignment(
 
     manager.keep_align_model_loaded = keep_align_loaded
     temp_files = []
+    original_filename = None   # 记录原始文件名
 
     try:
-        # ---- 预处理音频（可选） ----
+        # 获取原始路径
         audio_path = safe_audio_path(audio_file)
         if not audio_path or not os.path.exists(audio_path):
             return "错误: 无法获取有效的音频文件路径", "", "", "", "", "", get_system_status()
 
-        if force_preprocess and audio_path:
-            temp_preprocessed = tempfile.mktemp(suffix="_16k_mono.wav")
+        # 记录原始文件名（用于输出文件命名）
+        original_filename = Path(audio_path).stem
+
+        # ---- 预处理音频（可选） ----
+        if force_preprocess:
+            # 使用 NamedTemporaryFile 安全创建临时文件
+            tmp = tempfile.NamedTemporaryFile(suffix="_16k_mono.wav", delete=False)
+            tmp.close()
+            temp_preprocessed = tmp.name
             cmd = [
                 FFMPEG_PATH, "-y", "-i", audio_path,
                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
@@ -878,9 +905,14 @@ def run_alignment(
                 temp_files.append(temp_preprocessed)
                 audio_path = temp_preprocessed
                 logger.info("音频已预处理为 16kHz 单声道")
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"音频预处理失败: {e.stderr}，使用原始音频")
-                # 不中断，继续使用原音频
+            except (subprocess.CalledProcessError, Exception) as e:
+                logger.warning(f"音频预处理失败: {e}，使用原始音频")
+                # 清除可能已创建的文件
+                try:
+                    os.unlink(temp_preprocessed)
+                except Exception:
+                    pass
+                # 继续使用原音频，音频路径不变
 
         # ---- 1. 对齐模型确定 ----
         local_align_models = manager.get_local_align_models()
@@ -1068,11 +1100,12 @@ def run_alignment(
             else:
                 warning_msg = f"⚠️ 段落数相差 {len_diff} 段（超过2），跳过双语生成。请调整副文稿段落结构。"
 
-        # ---- 8. 保存文件 ----
+        # ---- 8. 保存文件（使用原始文件名） ----
         output_dir = PROJECT_ROOT / "output" / "字幕自动打轴"
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        base_name = Path(audio_path).stem
+        # 使用原始音频文件名，避免临时文件名污染
+        base_name = original_filename or "unknown_audio"
         prefix = f"{base_name}_align_{timestamp}"
         safe_lang_tag = ""
         if secondary_lang and secondary_lang.strip():
@@ -1119,7 +1152,7 @@ def run_alignment(
             system_info
         )
     finally:
-        # 清理临时预处理文件
+        # 清理所有临时文件（包括可能的预处理文件）
         for f in temp_files:
             try:
                 os.unlink(f)
@@ -1168,7 +1201,12 @@ def create_ui():
         with gr.Row():
             with gr.Column(scale=1):
                 audio_input = gr.File(label="选择音频文件", file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"])
-                # 新增预处理开关
+                # ★ 新增音频预览（只读）
+                audio_preview = gr.Audio(
+                    label="🎧 音频预览（上传后可试听）",
+                    interactive=False,
+                    visible=False
+                )
                 force_preprocess_check = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道 (推荐大文件)", value=True)
                 primary_text = gr.Textbox(label="主文稿（对齐用）", lines=20, placeholder="粘贴与音频语言一致的稿子...")
                 secondary_text = gr.Textbox(label="副文稿（挂载用，可选）", lines=20, placeholder="粘贴任意语种的翻译稿...")
@@ -1253,6 +1291,13 @@ def create_ui():
                     with gr.Tab("双语 SRT（主上、副下）"):
                         dual_output = gr.Textbox(label="双语字幕", lines=20, show_copy_button=True)
 
+        # 音频预览更新
+        def update_audio_preview(file_path):
+            if file_path:
+                return gr.update(value=file_path, visible=True)
+            return gr.update(value=None, visible=False)
+        audio_input.change(update_audio_preview, inputs=[audio_input], outputs=[audio_preview])
+
         align_sync_lang.change(toggle_align_model_manual, inputs=[align_sync_lang], outputs=[align_model_manual])
 
         run_btn.click(
@@ -1266,7 +1311,7 @@ def create_ui():
                 silence_slider, merge_punc, merge_silence,
                 merge_wordcount, merge_charcount, merge_duration,
                 merge_newline, keep_align_loaded,
-                force_preprocess_check,  # 新增传入
+                force_preprocess_check,
             ],
             outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, system_box],
         )
@@ -1275,8 +1320,8 @@ def create_ui():
             clear_outputs,
             outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, system_box],
         ).then(
-            lambda: [None, "", "", "", False],
-            outputs=[audio_input, primary_text, secondary_text, secondary_lang, enable_dual],
+            lambda: [None, None, "", "", "", False],
+            outputs=[audio_input, audio_preview, primary_text, secondary_text, secondary_lang, enable_dual],
         )
 
         refresh_align_btn.click(refresh_align_model_list, outputs=[align_model_manual])
@@ -1310,7 +1355,7 @@ def main():
                 server_port=p,
                 inbrowser=True,
                 show_error=True,
-                max_file_size=500 * 1024 * 1024   # 500MB，匹配 whisperX 设置
+                max_file_size=500 * 1024 * 1024
             )
             break
         except OSError:
