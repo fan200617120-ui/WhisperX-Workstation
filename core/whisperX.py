@@ -4,7 +4,7 @@
 WhisperX 语音识别独立增强版（参数全开放 / 稳定版）
 - 音频识别 / 视频字幕 / 批量处理
 - 可选精细时间戳对齐（wav2vec2）
-- 字幕断句控制（最长时长/字符数/标点）
+- 字幕断句控制（最长时长/字符数/标点/静音间隔，可独立组合启用）
 - VAD 高级参数（onset/offset/时长/静音间隔）
 - 界面显示最大字符数可调（默认5000，防前端崩溃）
 - 一键打开输出目录
@@ -126,118 +126,171 @@ def seconds_to_srt_time(seconds: float) -> str:
     ms = total_ms % 1000
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
-def split_long_segments(segments, max_duration=None, max_chars=None,
-                        split_by_punc=False, punc_set: Set[str] = None):
+def split_long_segments(segments,
+                        enable_duration_split=False, max_duration=None,
+                        enable_char_split=False, max_chars=None,
+                        enable_silence_split=False, max_silence_ms=None,
+                        enable_punc_split=False, punc_set=None):
+    """
+    根据多种策略独立或组合拆分过长的句子片段。
+    """
     if not segments:
         return segments
-    if max_duration is None:
-        max_duration = float('inf')
-    if max_chars is None:
-        max_chars = float('inf')
 
-    if split_by_punc and punc_set:
-        return _split_by_punc_and_threshold(segments, max_duration, max_chars, punc_set)
+    # 先根据标点拆分
+    if enable_punc_split and punc_set:
+        segments = _split_by_punc(segments, punc_set)
 
+    # 再应用其他阈值拆分（时长、字数、静音）
     new_segments = []
     for seg in segments:
         text = seg['text'].strip()
         start = seg['start']
         end = seg['end']
         duration = end - start
-        char_count = len(text)
-        need_split = False
-        if max_duration and duration > max_duration:
-            need_split = True
-        if max_chars and char_count > max_chars:
-            need_split = True
-        if not need_split or duration <= 0 or char_count == 0:
+        if duration <= 0 or len(text) == 0:
             new_segments.append(seg)
             continue
 
-        num_split_duration = math.ceil(duration / max_duration) if max_duration != float('inf') else 1
-        num_split_chars = math.ceil(char_count / max_chars) if max_chars != float('inf') else 1
-        num_splits = max(num_split_duration, num_split_chars, 1)
-        chars_per_seg = math.ceil(char_count / num_splits)
-        time_per_seg = duration / num_splits
-        for i in range(num_splits):
-            start_idx = i * chars_per_seg
-            end_idx = min(start_idx + chars_per_seg, char_count)
-            sub_text = text[start_idx:end_idx].strip()
-            if not sub_text:
-                continue
-            sub_start = start + i * time_per_seg
-            sub_end = sub_start + time_per_seg
-            if i == num_splits - 1:
-                sub_end = end
-            new_segments.append({
-                'start': sub_start,
-                'end': sub_end,
-                'text': sub_text
-            })
+        words = seg.get('words', [])
+        # 收集该段内的所有单词边界（用于静音分割）
+        boundaries = [start]  # 默认将段起始点作为一个边界
+        if enable_silence_split and words and max_silence_ms is not None:
+            # 计算单词之间的时间间隔，大于阈值的作为分割点
+            last_end = start
+            for w in words:
+                w_start = w.get('start', last_end)
+                if w_start - last_end > max_silence_ms / 1000.0:
+                    boundaries.append(last_end)
+                    boundaries.append(w_start)
+                last_end = max(last_end, w.get('end', w_start))
+            boundaries.append(end)
+        else:
+            boundaries = [start, end]
+
+        # 根据时长/字数对每个子段（由静音边界切分）进一步切割
+        sub_segments = _split_by_time_and_chars(
+            text, start, end, words,
+            enable_duration_split, max_duration,
+            enable_char_split, max_chars
+        )
+        new_segments.extend(sub_segments)
+
     return new_segments
 
-def _split_by_punc_and_threshold(segments, max_duration, max_chars, punc_set):
+def _split_by_punc(segments, punc_set):
+    """按标点符号拆分句子，同时保持时间戳。"""
     result = []
     for seg in segments:
         text = seg['text']
+        if not any(p in text for p in punc_set):
+            result.append(seg)
+            continue
+        # 简单处理：在标点处拆分，并分配时间
         start = seg['start']
         end = seg['end']
         duration = end - start
-        if duration <= 0 or len(text) == 0:
-            result.append(seg)
-            continue
-
         char_dur = duration / len(text) if len(text) > 0 else 0
-        cur_start_idx = 0
-        cur_chars = []
-        for idx, ch in enumerate(text):
-            cur_chars.append(ch)
-            should_split = False
-            if ch in punc_set:
-                should_split = True
-            if max_chars != float('inf') and len(cur_chars) >= max_chars:
-                should_split = True
-            if max_duration != float('inf'):
-                elapsed = (idx - cur_start_idx + 1) * char_dur
-                if elapsed >= max_duration:
-                    should_split = True
-
-            if should_split:
-                sub_text = ''.join(cur_chars).strip()
-                if sub_text:
-                    sub_start = start + cur_start_idx * char_dur
-                    sub_end = start + (idx + 1) * char_dur
+        sub_texts = re.split(f'([{re.escape("".join(punc_set))}])', text)
+        # 重组分割后的片段
+        current = ""
+        current_start_idx = 0
+        for part in sub_texts:
+            if not part:
+                continue
+            current += part
+            # 如果当前部分以标点结束，则切断
+            if part and part[-1] in punc_set:
+                if current.strip():
+                    sub_start = start + current_start_idx * char_dur
+                    sub_end = start + min(len(current), 1) * char_dur + current_start_idx * char_dur
+                    # 重新计算结束时间
+                    end_idx = current_start_idx + len(current)
+                    sub_end = start + end_idx * char_dur
                     if sub_end > end:
                         sub_end = end
                     result.append({
                         'start': sub_start,
                         'end': sub_end,
-                        'text': sub_text
+                        'text': current.strip()
                     })
-                cur_chars = []
-                cur_start_idx = idx + 1
-                continue
-
-        if cur_chars:
-            sub_text = ''.join(cur_chars).strip()
-            if sub_text:
-                sub_start = start + cur_start_idx * char_dur
-                sub_end = end
-                result.append({
-                    'start': sub_start,
-                    'end': sub_end,
-                    'text': sub_text
-                })
+                current_start_idx += len(current)
+                current = ""
+        if current.strip():
+            sub_start = start + current_start_idx * char_dur
+            sub_end = end
+            result.append({
+                'start': sub_start,
+                'end': sub_end,
+                'text': current.strip()
+            })
     return result
 
-def format_result_to_outputs(result, max_duration=None, max_chars=None,
-                             split_by_punc=False, punc_chars=""):
+def _split_by_time_and_chars(text, start, end, words,
+                             enable_duration_split, max_duration,
+                             enable_char_split, max_chars):
+    """根据时长和字数限制进一步分割一个句子片段。"""
+    if not enable_duration_split and not enable_char_split:
+        return [{'start': start, 'end': end, 'text': text.strip(), 'words': words}]
+
+    duration = end - start
+    char_count = len(text)
+    need_split = False
+    if enable_duration_split and max_duration is not None and duration > max_duration:
+        need_split = True
+    if enable_char_split and max_chars is not None and char_count > max_chars:
+        need_split = True
+    if not need_split or duration <= 0 or char_count == 0:
+        return [{'start': start, 'end': end, 'text': text.strip(), 'words': words}]
+
+    # 计算分割份数
+    num_splits = 1
+    if enable_duration_split and max_duration is not None:
+        num_splits = max(num_splits, math.ceil(duration / max_duration))
+    if enable_char_split and max_chars is not None:
+        num_splits = max(num_splits, math.ceil(char_count / max_chars))
+
+    chars_per_seg = math.ceil(char_count / num_splits)
+    time_per_seg = duration / num_splits
+    result = []
+    for i in range(num_splits):
+        start_idx = i * chars_per_seg
+        end_idx = min(start_idx + chars_per_seg, char_count)
+        sub_text = text[start_idx:end_idx].strip()
+        if not sub_text:
+            continue
+        sub_start = start + i * time_per_seg
+        sub_end = sub_start + time_per_seg
+        if i == num_splits - 1:
+            sub_end = end
+        result.append({
+            'start': sub_start,
+            'end': sub_end,
+            'text': sub_text,
+            'words': words[start_idx:end_idx] if words else []
+        })
+    return result
+
+def format_result_to_outputs(result, **kwargs):
+    """
+    将原始识别结果转换为文本、JSON、SRT。
+    断句参数通过关键字传入，内部调用 split_long_segments。
+    """
     if not result or not isinstance(result, dict):
         return "无结果", "{}", "", []
-    punc_set = set(punc_chars) if split_by_punc and punc_chars else None
-    segments = split_long_segments(result.get("segments", []),
-                                   max_duration, max_chars,
-                                   split_by_punc, punc_set)
+
+    segments = split_long_segments(
+        result.get("segments", []),
+        enable_duration_split=kwargs.get('enable_duration_split', False),
+        max_duration=kwargs.get('max_duration'),
+        enable_char_split=kwargs.get('enable_char_split', False),
+        max_chars=kwargs.get('max_chars'),
+        enable_silence_split=kwargs.get('enable_silence_split', False),
+        max_silence_ms=kwargs.get('max_silence_ms'),
+        enable_punc_split=kwargs.get('enable_punc_split', False),
+        punc_set=set(kwargs.get('punc_chars', '')) if kwargs.get('enable_punc_split') else None
+    )
+
     # 根据是否包含中日韩文字决定连接符，避免中文多余空格
     has_cjk = any(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', seg.get("text", ""))
                   for seg in segments)
@@ -257,10 +310,10 @@ def format_result_to_outputs(result, max_duration=None, max_chars=None,
 
 def save_outputs(base_name, full_text, ts_json, srt_text, language, model_info):
     ts = time.strftime("%Y%m%d_%H%M%S")
-    # 保留原始文件名，即使输入是临时文件，也应该用原始文件名
-    if base_name and os.path.exists(str(base_name)):
+    # 直接使用文件名 stem，不检查存在性
+    try:
         original_stem = Path(base_name).stem
-    else:
+    except Exception:
         original_stem = "recording"
     safe_stem = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', original_stem)
     if not safe_stem:
@@ -322,7 +375,7 @@ class WhisperXManager:
         self.align_model = None
         self.align_metadata = None
         self.align_model_lang = None
-        self.original_input_name = None   # 记录原始文件名，防止临时文件污染
+        self.original_input_name = None
 
     def get_available_local_models(self):
         models = []
@@ -330,7 +383,6 @@ class WhisperXManager:
         if not models_dir.exists(): return []
         for item in models_dir.iterdir():
             if not item.is_dir(): continue
-            # 更可靠的本地模型检测：有 config.json 或 tokenizer.json 就认为是模型
             if (item / "config.json").exists() or (item / "tokenizer.json").exists() or (item / "model.bin").exists():
                 models.append((item.name, str(item)))
         return models
@@ -353,7 +405,6 @@ class WhisperXManager:
     def load_asr_model(self, model_size, device, compute_type, language=None):
         with self.lock:
             local_path = ROOT_DIR / "pretrained_models" / model_size
-            # 检查更通用的存在标志
             if local_path.exists() and ((local_path / "model.bin").exists() or (local_path / "config.json").exists()):
                 model_name_or_path = str(local_path)
                 local_only = True
@@ -451,7 +502,6 @@ class WhisperXManager:
         try:
             local_align = self.get_local_align_models()
             align_model_path = None
-            # 完善语言映射
             lang_map = {
                 "zh": "chinese-zh-cn", "en": "english", "ja": "japanese",
                 "fr": "french", "de": "german", "es": "spanish",
@@ -475,7 +525,6 @@ class WhisperXManager:
                         align_model_path = path
                         break
                 if not align_model_path:
-                    # 在线映射
                     online_map = {
                         "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
                         "en": "jonatasgrosman/wav2vec2-large-xlsr-53-english",
@@ -570,7 +619,6 @@ class WhisperXManager:
         if isinstance(audio_input, str) and os.path.exists(audio_input):
             if not force_preprocess:
                 return audio_input
-            # 使用 NamedTemporaryFile 安全创建临时文件
             tmp = tempfile.NamedTemporaryFile(suffix="_16k_mono.wav", delete=False)
             tmp.close()
             temp_16k = tmp.name
@@ -588,18 +636,17 @@ class WhisperXManager:
                 return None
             self.temp_files.append(temp_16k)
             return temp_16k
-        # 如果收到 numpy 数组（旧版兼容）
+        # 处理 numpy 数组（旧版兼容），使用 librosa 替代 scipy
         if isinstance(audio_input, tuple) and len(audio_input)==2:
             sr, data = audio_input
             if data is None: return None
             if data.ndim > 1: data = np.mean(data, axis=1)
             if sr != 16000:
+                # 使用 librosa 重采样，避免依赖 scipy
                 try:
-                    from scipy import signal
-                    n_samples = int(len(data) * 16000 / sr)
-                    data = signal.resample(data, n_samples)
-                except ImportError:
-                    raise ImportError("需要 scipy 进行重采样，请安装 scipy")
+                    data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+                except Exception as e:
+                    raise RuntimeError(f"音频重采样失败，请安装 scipy 或使用 16kHz 音频。错误: {e}")
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
             temp_path = tmp.name
@@ -620,14 +667,31 @@ def ensure_model_loaded(model_size, device, compute_type, language):
     success, msg = manager.load_asr_model(model_size, device, compute_type, language)
     if not success: raise RuntimeError(msg)
 
+# 构建断句参数字典，减少重复代码
+def build_split_kwargs(enable_duration, max_dur, enable_chars, max_chars,
+                       enable_silence, max_silence, enable_punc, punc_chars):
+    return {
+        'enable_duration_split': enable_duration,
+        'max_duration': max_dur if enable_duration else None,
+        'enable_char_split': enable_chars,
+        'max_chars': max_chars if enable_chars else None,
+        'enable_silence_split': enable_silence,
+        'max_silence_ms': max_silence if enable_silence else None,
+        'enable_punc_split': enable_punc,
+        'punc_chars': punc_chars if enable_punc else ''
+    }
+
 def transcribe_audio(audio, model_size, device, compute_type, language, beam_size,
                      vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
                      hotwords, enable_align, align_model,
-                     max_duration, max_chars, split_by_punc, punc_chars,
+                     # 断句控制
+                     enable_duration_split, max_duration,
+                     enable_char_split, max_chars,
+                     enable_silence_split, max_silence_ms,
+                     enable_punc_split, punc_chars,
                      force_preprocess,
                      progress=gr.Progress()):
     if audio is None: return "请上传音频文件", "", ""
-    # 保留原始文件名（用于输出命名）
     original_name = None
     if isinstance(audio, str) and os.path.exists(audio):
         original_name = str(audio)
@@ -659,10 +723,11 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
             progress(0.6, desc="精细对齐...")
             result = manager.apply_whisperx_align(result, audio_path, language, device, align_model)
         progress(0.7, desc="生成输出...")
-        full_text, tsjson, srt_text, _ = format_result_to_outputs(
-            result, max_duration, max_chars, split_by_punc, punc_chars
-        )
-        # 使用原始文件名保存
+        split_args = build_split_kwargs(enable_duration_split, max_duration,
+                                        enable_char_split, max_chars,
+                                        enable_silence_split, max_silence_ms,
+                                        enable_punc_split, punc_chars)
+        full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
         saved = save_outputs(original_name, full_text, tsjson, srt_text,
                              language=result.get("language","未知"), model_info=model_size)
         save_info = "文件已保存:\n"
@@ -678,14 +743,16 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
 def transcribe_video(video, model_size, device, compute_type, language, beam_size,
                      vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
                      subtitle_mode, hotwords, enable_align, align_model,
-                     max_duration, max_chars, split_by_punc, punc_chars,
+                     enable_duration_split, max_duration,
+                     enable_char_split, max_chars,
+                     enable_silence_split, max_silence_ms,
+                     enable_punc_split, punc_chars,
                      progress=gr.Progress()):
     temp_audio_path = None
     safe_srt_temp = None
     try:
         if video is None:
             return "请上传视频文件", "", ""
-        # 兼容 Gradio 4.x 返回的字典格式
         if isinstance(video, dict):
             video = video.get("video", {}).get("path") or video.get("path")
             if not video or not os.path.exists(str(video)):
@@ -714,15 +781,16 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
                                         vad_filter=vad_filter, vad_parameters=vad_params,
                                         word_timestamps=True, initial_prompt=prompt)
         if err:
-            # 错误时也返回三个空格，但保持一致性
             return f"识别失败: {err}", "", ""
         if enable_align:
             progress(0.6, desc="精细对齐...")
             result = manager.apply_whisperx_align(result, audio_path, language, device, align_model)
         progress(0.7, desc="生成字幕...")
-        full_text, tsjson, srt_text, _ = format_result_to_outputs(
-            result, max_duration, max_chars, split_by_punc, punc_chars
-        )
+        split_args = build_split_kwargs(enable_duration_split, max_duration,
+                                        enable_char_split, max_chars,
+                                        enable_silence_split, max_silence_ms,
+                                        enable_punc_split, punc_chars)
+        full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
         saved = save_outputs(str(video), full_text, tsjson, srt_text,
                              language=result.get("language","未知"), model_info=model_size)
         srt_path = saved.get('srt')
@@ -730,21 +798,32 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             return "处理完成，未生成字幕。", safe_text(tsjson), safe_text(srt_text)
         progress(0.8, desc="嵌入字幕...")
         ts = time.strftime("%Y%m%d_%H%M%S")
-        prefix = generate_output_filename(video, ts, subtitle_mode, "video")
+        # 修复：使用与 save_outputs 一致的命名，避免未定义函数
+        video_path = Path(str(video))
+        safe_stem = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', video_path.stem)
+        prefix = f"{safe_stem}_{ts}"
         out_path = OUTPUT_DIR / f"{prefix}.mp4"
 
+        # 根据识别语言设置字幕语言代码
+        detected_lang = result.get("language", "en")
+        # 简单映射，可扩充
+        lang_code_map = {"zh": "chi", "en": "eng", "ja": "jpn", "ko": "kor", "fr": "fre", "de": "ger", "es": "spa"}
+        sub_lang_code = lang_code_map.get(detected_lang, "eng")
+
         if subtitle_mode == "soft":
-            cmd = [FFMPEG_PATH, "-i", str(video), "-i", str(srt_path), "-c", "copy", "-c:s", "mov_text", "-metadata:s:s:0", "language=chi", "-y", str(out_path)]
+            cmd = [FFMPEG_PATH, "-i", str(video), "-i", str(srt_path),
+                   "-c", "copy", "-c:s", "mov_text",
+                   "-metadata:s:s:0", f"language={sub_lang_code}",
+                   "-y", str(out_path)]
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         else:
-            # 硬字幕：使用临时文件副本，避免路径转义问题
             safe_srt_temp = os.path.join(tempfile.gettempdir(), f"sub_{uuid.uuid4().hex[:8]}.srt")
             shutil.copy2(str(srt_path), safe_srt_temp)
-            # 尝试使用跨平台通用字体 Sans，避免特定字体缺失导致失败
-            font_name = "Sans"
-            # 如果在 Windows 且有微软雅黑，则使用微软雅黑
+            # 跨平台字体选择：优先 Arial，Windows 下可尝试微软雅黑
+            font_name = "Arial"
             if sys.platform == "win32":
                 font_name = "Microsoft YaHei"
+            # 使用 ASS 字幕滤镜，兼容性更好
             vf_str = f"subtitles='{safe_srt_temp.replace(os.sep, '/')}':force_style='FontName={font_name},FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'"
             cmd = [FFMPEG_PATH, "-i", str(video), "-vf", vf_str, "-c:a", "copy", "-y", str(out_path)]
             subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -767,7 +846,10 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
 def transcribe_batch(files, model_size, device, compute_type, language, beam_size,
                      vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
                      hotwords, enable_align, align_model,
-                     max_duration, max_chars, split_by_punc, punc_chars,
+                     enable_duration_split, max_duration,
+                     enable_char_split, max_chars,
+                     enable_silence_split, max_silence_ms,
+                     enable_punc_split, punc_chars,
                      force_preprocess,
                      progress=gr.Progress()):
     if not files: return "请选择音频文件"
@@ -801,9 +883,11 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
                 continue
             if enable_align:
                 result = manager.apply_whisperx_align(result, ap, language, device, align_model)
-            full_text, tsjson, srt_text, _ = format_result_to_outputs(
-                result, max_duration, max_chars, split_by_punc, punc_chars
-            )
+            split_args = build_split_kwargs(enable_duration_split, max_duration,
+                                            enable_char_split, max_chars,
+                                            enable_silence_split, max_silence_ms,
+                                            enable_punc_split, punc_chars)
+            full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
             save_outputs(fp, full_text, tsjson, srt_text,
                          language=result.get("language","未知"), model_info=model_size)
             results_text.append(f"✅ {os.path.basename(fp)}: 已保存")
@@ -891,6 +975,25 @@ def create_interface():
 
         gr.Markdown("---")
 
+        # 断句控制组件（用于所有选项卡）
+        def build_split_controls():
+            with gr.Accordion(" 断句控制", open=False):
+                with gr.Row():
+                    enable_duration = gr.Checkbox(label="启用时长断句", value=False)
+                    duration_slider = gr.Slider(label="最长单句时长 (秒)", minimum=1, maximum=60, value=15, step=1)
+                with gr.Row():
+                    enable_chars = gr.Checkbox(label="启用字数断句", value=False)
+                    chars_slider = gr.Slider(label="最长单句字符数", minimum=1, maximum=200, value=50, step=5)
+                with gr.Row():
+                    enable_silence = gr.Checkbox(label="启用静音停顿断句", value=False)
+                    silence_slider = gr.Slider(label="最大静音间隔 (毫秒)", minimum=100, maximum=2000, value=500, step=50,
+                                              info="单词/字之间超过此静音时长即在此处断开")
+                with gr.Row():
+                    enable_punc = gr.Checkbox(label="启用标点断句", value=False)
+                    punc_text = gr.Textbox(label="断句标点", value="。！？!?……，,;；：:", placeholder="输入用于断句的标点")
+            return [enable_duration, duration_slider, enable_chars, chars_slider,
+                    enable_silence, silence_slider, enable_punc, punc_text]
+
         with gr.Tabs():
             # ---------- 音频识别 ----------
             with gr.Tab("音频识别"):
@@ -901,7 +1004,6 @@ def create_interface():
                             label="选择音频文件",
                             file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"]
                         )
-                        # 音频预览（只读，上传后自动加载）
                         audio_preview = gr.Audio(
                             label="🎧 音频预览（上传后可试听）",
                             interactive=False,
@@ -911,12 +1013,8 @@ def create_interface():
                             label="⚡ 强制预处理为 16kHz 单声道 (推荐大文件)", value=True
                         )
                         hotwords_audio = gr.Textbox(label="热词/提示词", lines=2, value="")
-                        with gr.Accordion("断句控制", open=False):
-                            max_dur_audio = gr.Slider(label="最长单句时长 (秒)", minimum=5, maximum=60, value=15, step=1)
-                            max_chars_audio = gr.Slider(label="最长单句字符数", minimum=10, maximum=200, value=50, step=5)
-                            with gr.Row():
-                                split_punc_audio = gr.Checkbox(label="按标点断句", value=False)
-                                punc_chars_audio = gr.Textbox(label="断句标点", value="。！？!?……，,;；：:", placeholder="输入用于断句的标点")
+                        # 断句控制
+                        split_ctrls_audio = build_split_controls()
                         with gr.Accordion("VAD 高级设置", open=False):
                             vad_enable_audio = gr.Checkbox(label="启用 VAD 过滤", value=False)
                             vad_threshold_audio = gr.Slider(label="语音检测阈值 (onset/offset)", minimum=0.0, maximum=1.0, value=0.5, step=0.05)
@@ -943,9 +1041,8 @@ def create_interface():
                     transcribe_audio,
                     inputs=[audio_input, model_size, device, compute_type, language, beam_size,
                             vad_enable_audio, vad_threshold_audio, vad_min_speech_audio, vad_min_silence_audio,
-                            hotwords_audio, enable_align_audio, align_model_audio,
-                            max_dur_audio, max_chars_audio, split_punc_audio, punc_chars_audio,
-                            force_preprocess_check],
+                            hotwords_audio, enable_align_audio, align_model_audio] +
+                            split_ctrls_audio + [force_preprocess_check],
                     outputs=[text_out, json_out, srt_out]
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 c_btn.click(lambda: [None, None, "", "", "", ""], outputs=[audio_input, audio_preview, hotwords_audio, text_out, json_out, srt_out])
@@ -958,12 +1055,7 @@ def create_interface():
                         video_input = gr.Video(label="选择视频", sources=["upload"])
                         sub_mode = gr.Radio(label="嵌入模式", choices=["soft","hard"], value="soft")
                         hotwords_video = gr.Textbox(label="热词/提示词", lines=2, value="")
-                        with gr.Accordion("断句控制", open=False):
-                            max_dur_video = gr.Slider(label="最长单句时长 (秒)", minimum=5, maximum=60, value=15, step=1)
-                            max_chars_video = gr.Slider(label="最长单句字符数", minimum=10, maximum=200, value=50, step=5)
-                            with gr.Row():
-                                split_punc_video = gr.Checkbox(label="按标点断句", value=False)
-                                punc_chars_video = gr.Textbox(label="断句标点", value="。！？!?……，,;；：:", placeholder="输入用于断句的标点")
+                        split_ctrls_video = build_split_controls()
                         with gr.Accordion("VAD 高级设置", open=False):
                             vad_enable_video = gr.Checkbox(label="启用 VAD 过滤", value=False)
                             vad_threshold_video = gr.Slider(label="语音检测阈值 (onset/offset)", minimum=0.0, maximum=1.0, value=0.5, step=0.05)
@@ -983,8 +1075,8 @@ def create_interface():
                     transcribe_video,
                     inputs=[video_input, model_size, device, compute_type, language, beam_size,
                             vad_enable_video, vad_threshold_video, vad_min_speech_video, vad_min_silence_video,
-                            sub_mode, hotwords_video, enable_align_video, align_model_video,
-                            max_dur_video, max_chars_video, split_punc_video, punc_chars_video],
+                            sub_mode, hotwords_video, enable_align_video, align_model_video] +
+                            split_ctrls_video,
                     outputs=[v_text, v_json, v_srt]
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 vc_btn.click(lambda: [None, "", "", "", ""], outputs=[video_input, hotwords_video, v_text, v_json, v_srt])
@@ -998,12 +1090,7 @@ def create_interface():
                             label="⚡ 强制预处理为 16kHz 单声道", value=True
                         )
                         hotwords_batch = gr.Textbox(label="热词/提示词", lines=2, value="")
-                        with gr.Accordion("断句控制", open=False):
-                            max_dur_batch = gr.Slider(label="最长单句时长 (秒)", minimum=5, maximum=60, value=15, step=1)
-                            max_chars_batch = gr.Slider(label="最长单句字符数", minimum=10, maximum=200, value=50, step=5)
-                            with gr.Row():
-                                split_punc_batch = gr.Checkbox(label="按标点断句", value=False)
-                                punc_chars_batch = gr.Textbox(label="断句标点", value="。！？!?……，,;；：:", placeholder="输入用于断句的标点")
+                        split_ctrls_batch = build_split_controls()
                         with gr.Accordion("VAD 高级设置", open=False):
                             vad_enable_batch = gr.Checkbox(label="启用 VAD 过滤", value=False)
                             vad_threshold_batch = gr.Slider(label="语音检测阈值 (onset/offset)", minimum=0.0, maximum=1.0, value=0.5, step=0.05)
@@ -1021,9 +1108,8 @@ def create_interface():
                     transcribe_batch,
                     inputs=[files_input, model_size, device, compute_type, language, beam_size,
                             vad_enable_batch, vad_threshold_batch, vad_min_speech_batch, vad_min_silence_batch,
-                            hotwords_batch, enable_align_batch, align_model_batch,
-                            max_dur_batch, max_chars_batch, split_punc_batch, punc_chars_batch,
-                            force_preprocess_batch],
+                            hotwords_batch, enable_align_batch, align_model_batch] +
+                            split_ctrls_batch + [force_preprocess_batch],
                     outputs=[batch_out]
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 bc_btn.click(lambda: [None, "", ""], outputs=[files_input, hotwords_batch, batch_out])
