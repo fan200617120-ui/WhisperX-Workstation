@@ -4,8 +4,9 @@
 字幕自动打轴独立 UI 版 —— 空行断句（推荐）·锚点增强版
 - 空行断句（推荐）：按文稿空行分段，稳定匹配音频时间戳
 - 叠加下方断句规则（标点、静音、字数、时长）进行段内细分
-- 字符锚点 + 时间密度锚点用于微调
+- 字符锚点 + 时间密度锚点用于微调（默认关闭）
 - 支持 24 种语言对齐
+- 支持批量文件夹自动配对
 Copyright 2026 光影的故事2018
 """
 
@@ -30,7 +31,6 @@ except ImportError as e:
     print(f"缺少基础依赖库: {e}")
     sys.exit(1)
 
-# ============= 修复 whisperx 导入 =============
 WHISPERX_ALIGN_AVAILABLE = False
 try:
     import whisperx.alignment
@@ -102,7 +102,7 @@ def _ensure_monotonic(sentences: List[Dict]) -> List[Dict]:
         result.append(s)
     return result
 
-# ---------- 时间密度锚点（微调）----------
+# ---------- 时间密度锚点 ----------
 def _time_density_split_points(items: List[Dict], start_idx: int, end_idx: int, min_gap: float = 0.18) -> List[int]:
     split_indices = []
     for i in range(start_idx, end_idx - 1):
@@ -132,7 +132,7 @@ def _refine_by_density(sentence: Dict, items: List[Dict], s_idx: int, e_idx: int
         end = start + 0.1
     return {"start": start, "end": end, "text": sentence["text"]}
 
-# ---------- 锚点组合（字符锚点 + 密度锚点）----------
+# ---------- 锚点组合 ----------
 def anchor_refine_sentences(
     sentences: List[Dict],
     aligned_items: List[Dict],
@@ -217,10 +217,9 @@ def anchor_refine_sentences(
                                               min_gap=density_min_gap))
     else:
         refined = refined_char
-
     return _ensure_monotonic(refined)
 
-# ============ 字符/词对齐算法 ============
+# ============ 对齐算法 ============
 def force_align_char_level(reference_text, transcribed_words, audio_duration=None):
     if not transcribed_words:
         return []
@@ -241,7 +240,7 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
     match_map = []
     for r_char in ref_chars:
         found = False
-        for offset in range(10):  # 减小搜索窗，防止跳跃太远
+        for offset in range(10):
             check_idx = hyp_idx + offset
             if check_idx < len(hyp_chars) and hyp_chars[check_idx] == r_char:
                 match_map.append(check_idx)
@@ -258,21 +257,19 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
             w_idx = char_to_word_idx[matched_hyp_idx]
             start_t = transcribed_words[w_idx]["start"]
             end_t = transcribed_words[w_idx]["end"]
-            # 计算当前字符在单词中的位置（前方字符数）
             count_in_word = 1
             for j in range(i - 1, -1, -1):
                 if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
                     count_in_word += 1
                 else:
                     break
-            # 计算从当前字符到单词结尾的字符数（包含当前字符）
             remain_in_word = 1
             for j in range(i + 1, len(ref_chars)):
                 if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
                     remain_in_word += 1
                 else:
                     break
-            total_chars_in_word = count_in_word + remain_in_word - 1   # 修复：单词总字符数
+            total_chars_in_word = count_in_word + remain_in_word - 1
             word_duration = end_t - start_t
             char_duration = max(word_duration / total_chars_in_word, 0.02) if total_chars_in_word > 0 else 0.02
             char_start = start_t + (count_in_word - 1) * char_duration
@@ -557,7 +554,7 @@ def generate_merged_srt(aligned_chars, sentences, paragraphs, merge_punctuations
     return sentences_to_srt(merged_segments)
 
 def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
-    """对一段连续的字符按规则合并，返回合并后的 segments 列表，智能避免词语断裂"""
+    """段内细分，带西文单词边界保护"""
     if not chars:
         return []
     punc_set = set(merge_params.get('punc_chars', '')) if merge_params.get('merge_by_punc') else set()
@@ -569,22 +566,14 @@ def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
             current_start = ch["start"]
         current_chars.append(ch)
         should_split = False
-
-        # 标点断句：遇到标点直接断
         if merge_params.get('merge_by_punc') and punc_set and ch["word"] in punc_set:
             should_split = True
-
-        # 静音断句
         if merge_params.get('merge_by_silence') and i < len(chars) - 1:
             gap = chars[i + 1]["start"] - ch["end"]
             if gap > 0 and gap > merge_params.get('silence_threshold', 0.3):
                 should_split = True
-
-        # 词数断句（按字符个数计量，因为粒度是char）
         if merge_params.get('merge_by_wordcount') and len(current_chars) >= merge_params.get('max_words', 20):
             should_split = True
-
-        # 字符数断句（带词语边界保护）
         text_so_far = "".join([c["word"] for c in current_chars])
         if merge_params.get('merge_by_charcount') and len(text_so_far) >= merge_params.get('max_chars', 30):
             next_char = chars[i + 1]["word"] if i + 1 < len(chars) else ""
@@ -602,12 +591,8 @@ def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
                     current_chars = current_chars[split_idx:]
                     current_start = current_chars[0]["start"] if current_chars else None
                     continue
-                else:
-                    pass
             else:
                 should_split = True
-
-        # 时长断句
         duration = ch["end"] - current_start
         if merge_params.get('merge_by_duration') and duration >= merge_params.get('max_duration', 10.0):
             should_split = True
@@ -626,17 +611,12 @@ def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
     return segments
 
 def _trim_char_seg_to_text(char_seg: List[Dict], paragraph_text: str) -> List[Dict]:
-    """
-    将字符片段裁剪到与规范化段落文本匹配的子段，防止包含相邻段落的字符。
-    """
     if not char_seg or not paragraph_text:
         return char_seg
-    # 规范化段落文本并与字符片段文本比对
     norm_text = normalize_text_for_alignment(paragraph_text, "char")
     seg_text = "".join([c["word"] for c in char_seg])
     if not norm_text:
         return char_seg
-    # 寻找最长前缀匹配
     best_start = 0
     best_len = 0
     for i in range(max(0, len(seg_text) - len(norm_text)) + 1):
@@ -651,12 +631,11 @@ def _trim_char_seg_to_text(char_seg: List[Dict], paragraph_text: str) -> List[Di
         if match_len > best_len:
             best_len = match_len
             best_start = i
-    # 必须匹配至少80%以上才采纳裁剪
     if best_len > 0 and best_len >= len(norm_text) * 0.8:
         return char_seg[best_start:best_start + len(norm_text)]
     return char_seg
 
-# ============ FFmpeg 等保持不变 ============
+# ============ FFmpeg 工具函数 ============
 def find_ffmpeg():
     portable_dir = PROJECT_ROOT / "ffmpeg" / "bin"
     if sys.platform == "win32":
@@ -908,7 +887,6 @@ def extract_words_from_result(result, align_granularity, use_whisperx_align):
         for i, w in enumerate(seg_words):
             if use_whisperx_align and align_granularity == "char" and "chars" in w:
                 chars_list = w["chars"]
-                # 过滤空白字符，防止空格影响对齐
                 valid_chars = [c for c in chars_list if "char" in c and c["char"].strip() != ""]
                 if not valid_chars:
                     words.append({"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)})
@@ -945,7 +923,7 @@ def safe_audio_path(audio_input):
         return audio_input.get("name") or audio_input.get("path")
     return None
 
-# ============ 核心对齐流程 ============
+# ============ 核心对齐函数 ============
 def run_alignment(
     audio_file, primary_text, secondary_text, secondary_lang, enable_dual,
     model_size, device, compute_type, primary_lang, beam_size,
@@ -959,9 +937,11 @@ def run_alignment(
     anchor_enable_start, anchor_enable_end, anchor_enable_mean,
     anchor_char_count,
     anchor_density_enable, anchor_forced_linebreak_enable,
-    density_min_gap, density_boundary_window, linebreak_window_frames,
-    progress=gr.Progress(),
+    density_min_gap, density_boundary_window,
+    progress: gr.Progress = None,
 ):
+    if progress is None:
+        progress = gr.Progress()
     if audio_file is None:
         return "错误: 请上传音频文件", "", "", "", "", "", "", get_system_status()
     if not primary_text or not primary_text.strip():
@@ -994,13 +974,13 @@ def run_alignment(
                 except Exception:
                     pass
 
-        # ---- 对齐模型选择（离线优先），修复 align_model_path 未初始化问题 ----
+        # ---- 对齐模型选择 ----
         local_align_models = manager.get_local_align_models()
         use_whisperx_align = False
         align_model_name_for_load = None
         align_model_dir_for_load = str(ALIGN_CACHE_DIR)
         align_model_display = ""
-        align_model_path = None   # 关键修复：变量初始化
+        align_model_path = None
 
         def match_local_by_lang(lang: str) -> Optional[str]:
             lang = lang.strip().lower()
@@ -1142,7 +1122,7 @@ def run_alignment(
 
         word_srt = words_to_srt(aligned)
 
-        # ---- 空行断句（推荐）分支 ----
+        # ---- 空行断句分支 ----
         if anchor_forced_linebreak_enable:
             paragraphs = re.split(r'\n\s*\n', primary_text.strip())
             paragraphs = [p.strip() for p in paragraphs if p.strip()]
@@ -1183,7 +1163,6 @@ def run_alignment(
                     merged_sentences.append(sent)
                     continue
                 char_seg = aligned[seg_start:seg_end]
-                # 关键修复：用段落文本修正字符片段，防止包含相邻段落字符
                 char_seg = _trim_char_seg_to_text(char_seg, sent["text"])
                 sub_segs = _merge_chars_by_rules(char_seg, merge_params)
                 if not sub_segs:
@@ -1334,7 +1313,77 @@ def set_max_length(val):
     current_max_output_length = int(val)
     return get_system_status()
 
-# ============ 界面（保持原布局） ============
+# ---------- 批量处理函数 ----------
+def batch_folder_align(
+    folder_path,
+    secondary_text, secondary_lang, enable_dual,
+    model_size, device, compute_type, primary_lang, beam_size,
+    vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
+    hotwords, align_sync_lang, align_model_manual, align_granularity,
+    punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+    silence_slider, merge_punc, merge_silence,
+    merge_wordcount, merge_charcount, merge_duration,
+    merge_newline, keep_align_loaded,
+    force_preprocess_check,
+    anchor_start, anchor_end, anchor_mean, anchor_count_slider,
+    anchor_density, anchor_forced_linebreak,
+    density_min_gap_slider, density_boundary_window_slider,
+    progress=gr.Progress()
+):
+    if not folder_path or not os.path.isdir(folder_path):
+        return "错误: 请提供有效的文件夹路径"
+    
+    folder = Path(folder_path)
+    audio_exts = {'.mp3', '.wav', '.m4a', '.flac', '.ogg'}
+    audio_files = [f for f in folder.iterdir() if f.suffix.lower() in audio_exts]
+    if not audio_files:
+        return "文件夹中未找到支持的音频文件"
+    
+    pairs = []
+    for audio_f in audio_files:
+        txt_f = folder / (audio_f.stem + '.txt')
+        if txt_f.exists():
+            pairs.append((audio_f, txt_f))
+    if not pairs:
+        return "未找到任何同名 .txt 文稿文件，请确保音频和文稿文件名相同（除扩展名外）"
+    
+    total = len(pairs)
+    results = []
+    for i, (audio_path, txt_path) in enumerate(pairs, 1):
+        progress((i)/total, desc=f"处理 {i}/{total}: {audio_path.name}")
+        try:
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                primary_text = f.read()
+            if not primary_text.strip():
+                results.append(f"❌ {audio_path.name}: 文稿为空")
+                continue
+            status, *_ = run_alignment(
+                str(audio_path), primary_text,
+                secondary_text, secondary_lang, enable_dual,
+                model_size, device, compute_type, primary_lang, beam_size,
+                vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
+                hotwords, align_sync_lang, align_model_manual, align_granularity,
+                punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+                silence_slider, merge_punc, merge_silence,
+                merge_wordcount, merge_charcount, merge_duration,
+                merge_newline, keep_align_loaded,
+                force_preprocess_check,
+                anchor_start, anchor_end, anchor_mean, anchor_count_slider,
+                anchor_density, anchor_forced_linebreak,
+                density_min_gap_slider, density_boundary_window_slider
+            )
+            if "错误" in status:
+                results.append(f"❌ {audio_path.name}: {status.split(chr(10))[0]}")
+            else:
+                results.append(f"✅ {audio_path.name}: 已完成")
+        except Exception as e:
+            results.append(f"❌ {audio_path.name}: 异常 - {str(e)}")
+    
+    total_success = sum(1 for r in results if r.startswith("✅"))
+    output = f"批量处理完成！成功: {total_success}/{total}\n" + "\n".join(results)
+    return output
+
+# ============ UI 界面 ============
 def create_ui():
     local_models = manager.get_local_models()
     model_choices = [name for name, _ in local_models]
@@ -1345,148 +1394,179 @@ def create_ui():
 
     local_align = manager.get_local_align_models()
     align_choices = ["无（使用默认）"] + [disp for disp, _ in local_align]
-
     all_languages = ["auto"] + list(LANGUAGE_ALIGN_MODEL_MAP.keys())
 
     with gr.Blocks(title="字幕自动打轴", theme=gr.themes.Default()) as demo:
-        gr.Markdown("# 🎬 字幕自动打轴（支持 24 种语言）")
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                audio_input = gr.File(label="选择音频文件", file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"])
-                audio_preview = gr.Audio(label="音频预览", interactive=False, visible=False)
-                force_preprocess_check = gr.Checkbox(label="强制预处理为 16kHz 单声道 (推荐大文件)", value=True)
-                primary_text = gr.Textbox(label="主文稿（对齐用）", lines=20, placeholder="粘贴稿子...")
-                secondary_text = gr.Textbox(label="副文稿（挂载用，可选）", lines=20, placeholder="翻译稿...")
+        gr.Markdown("# 🎬 字幕自动打轴 稳定版（支持 24 种语言_stable）")
+        
+        with gr.Tabs():
+            with gr.Tab("单文件处理"):
                 with gr.Row():
-                    secondary_lang = gr.Textbox(label="副文稿语言标记", value="", scale=1)
-                    enable_dual = gr.Checkbox(label="生成双语字幕", value=False, scale=1)
+                    with gr.Column(scale=1):
+                        audio_input = gr.File(label="选择音频文件", file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"])
+                        audio_preview = gr.Audio(label="音频预览", interactive=False, visible=False)
+                        force_preprocess_check = gr.Checkbox(label="强制预处理为 16kHz 单声道 (推荐大文件)", value=True)
+                        primary_text = gr.Textbox(label="主文稿（对齐用）", lines=20, placeholder="粘贴稿子...")
+                        secondary_text = gr.Textbox(label="副文稿（挂载用，可选）", lines=20, placeholder="翻译稿...")
+                        with gr.Row():
+                            secondary_lang = gr.Textbox(label="副文稿语言标记", value="", scale=1)
+                            enable_dual = gr.Checkbox(label="生成双语字幕", value=False, scale=1)
 
-            with gr.Column(scale=2):
+                    with gr.Column(scale=2):
+                        with gr.Row():
+                            status_box = gr.Textbox(label="任务状态", value="等待开始", lines=4, interactive=False)
+                            system_box = gr.Textbox(label="系统信息", value=get_system_status(), lines=4, interactive=False)
+
+                        with gr.Accordion("模型与识别参数", open=True):
+                            model_drop = gr.Dropdown(label="ASR模型", choices=model_choices, value=model_choices[0] if model_choices else "medium")
+                            with gr.Row():
+                                device_drop = gr.Dropdown(label="设备", choices=["cuda", "cpu"], value="cuda" if torch.cuda.is_available() else "cpu")
+                                compute_drop = gr.Dropdown(label="计算类型", choices=["int8_float32", "float16", "float32"], value="int8_float32")
+                            with gr.Row():
+                                primary_lang = gr.Dropdown(label="主语言", choices=all_languages, value="zh")
+                                beam_slider = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)
+                            hotwords_box = gr.Textbox(label="热词/提示词", lines=2, value="")
+
+                        with gr.Accordion("VAD 高级设置", open=False):
+                            vad_filter = gr.Checkbox(label="启用 VAD 过滤", value=True)
+                            vad_threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="语音检测阈值")
+                            vad_min_speech = gr.Slider(100, 1000, value=250, step=50, label="最短语音 (ms)")
+                            vad_min_silence = gr.Slider(50, 1000, value=100, step=50, label="最短静音 (ms)")
+
+                        with gr.Accordion("对齐模型设置", open=True):
+                            align_sync_lang = gr.Checkbox(label="对齐模型跟随主语言自动匹配", value=True)
+                            align_model_manual = gr.Dropdown(label="手动选择对齐模型", choices=align_choices, value="无（使用默认）", visible=False)
+                            refresh_align_btn = gr.Button("刷新对齐模型列表", size="sm")
+                            align_granularity = gr.Radio(label="对齐粒度", choices=[("字符级", "char"), ("单词级", "word")], value="char")
+                            keep_align_loaded = gr.Checkbox(label="保持对齐模型加载", value=False)
+
+                        with gr.Accordion("字幕合并规则", open=True):
+                            with gr.Row():
+                                merge_newline = gr.Checkbox(label="按空行分段(推荐)", value=True)
+                                merge_punc = gr.Checkbox(label="按标点断句", value=False)
+                                merge_silence = gr.Checkbox(label="按静音断句", value=False)
+                            with gr.Row():
+                                merge_wordcount = gr.Checkbox(label="按词数断句", value=False)
+                                merge_charcount = gr.Checkbox(label="按字符数断句", value=False)
+                                merge_duration = gr.Checkbox(label="按时长断句", value=False)
+                            with gr.Row():
+                                punc_box = gr.Textbox(label="句末标点", value="，；。！？,;.!?", scale=2)
+                                silence_slider = gr.Slider(0.1, 1.0, value=0.3, step=0.05, label="静音阈值 (秒)")
+                            with gr.Row():
+                                max_words_slider = gr.Slider(5, 50, value=20, step=1, label="最大词数")
+                                max_chars_slider = gr.Slider(5, 100, value=30, step=5, label="最大字符数")
+                                max_duration_slider = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="最大时长 (秒)")
+
+                        with gr.Accordion("锚点增强 (实验性，不建议轻易开启)", open=False):
+                            with gr.Row():
+                                anchor_start = gr.Checkbox(label="前锚点", value=False)
+                                anchor_end = gr.Checkbox(label="后锚点", value=False)
+                                anchor_mean = gr.Checkbox(label="前后均值", value=False)
+                                anchor_count_slider = gr.Slider(1, 5, value=3, step=1, label="锚点参考单位数")
+                            with gr.Row():
+                                anchor_density = gr.Checkbox(label="时间密度锚点", value=False)
+                            with gr.Row():
+                                density_min_gap_slider = gr.Slider(0.05, 0.5, value=0.18, step=0.01, label="密度最小间隙(秒)")
+                                density_boundary_window_slider = gr.Slider(1, 6, value=3, step=1, label="密度边界窗口(单位数)")
+                            gr.Markdown("---")
+                            gr.Markdown("### ⚠️ 实验性：段内规则细分")
+                            anchor_forced_linebreak = gr.Checkbox(
+                                label="按规则对空行段落二次细分（实验性，建议保持关闭）",
+                                value=False,
+                                info="先按空行分段，然后应用下方断句规则对每段内部切分。关闭时仅按空行断句，稳定性最高。"
+                            )
+
+                        with gr.Accordion("输出控制", open=False):
+                            open_output_btn = gr.Button("打开输出目录", variant="secondary")
+                            max_text_len_slider = gr.Slider(2000, 50000, value=current_max_output_length, step=2000, label="界面最大显示字符数")
+                            open_output_btn.click(open_output_folder, inputs=None, outputs=None)
+                            max_text_len_slider.change(set_max_length, inputs=[max_text_len_slider], outputs=[system_box])
+
+                        with gr.Row():
+                            run_btn = gr.Button("开始对齐", variant="primary", size="lg")
+                            clear_btn = gr.Button("清空")
+
+                        with gr.Tabs():
+                            with gr.Tab("逐词/逐字 SRT"):
+                                word_output = gr.Textbox(label="逐词字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("整句 SRT"):
+                                sent_output = gr.Textbox(label="整句字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("合并字幕"):
+                                merged_output = gr.Textbox(label="合并字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("锚点增强 SRT"):
+                                anchor_output = gr.Textbox(label="锚点增强字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("副文稿单语 SRT"):
+                                secondary_output = gr.Textbox(label="副文稿字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("双语 SRT"):
+                                dual_output = gr.Textbox(label="双语字幕", lines=20, show_copy_button=True)
+
+                        def update_audio_preview(file_path):
+                            if file_path:
+                                return gr.update(value=file_path, visible=True)
+                            return gr.update(value=None, visible=False)
+                        audio_input.change(update_audio_preview, inputs=[audio_input], outputs=[audio_preview])
+                        align_sync_lang.change(toggle_align_model_manual, inputs=[align_sync_lang], outputs=[align_model_manual])
+
+                        run_btn.click(
+                            run_alignment,
+                            inputs=[
+                                audio_input, primary_text, secondary_text, secondary_lang, enable_dual,
+                                model_drop, device_drop, compute_drop, primary_lang, beam_slider,
+                                vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
+                                hotwords_box, align_sync_lang, align_model_manual, align_granularity,
+                                punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+                                silence_slider, merge_punc, merge_silence,
+                                merge_wordcount, merge_charcount, merge_duration,
+                                merge_newline, keep_align_loaded,
+                                force_preprocess_check,
+                                anchor_start, anchor_end, anchor_mean, anchor_count_slider,
+                                anchor_density, anchor_forced_linebreak,
+                                density_min_gap_slider, density_boundary_window_slider
+                            ],
+                            outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_box],
+                        )
+
+                        clear_btn.click(
+                            clear_outputs,
+                            outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_box],
+                        ).then(
+                            lambda: [None, None, "", "", "", False],
+                            outputs=[audio_input, audio_preview, primary_text, secondary_text, secondary_lang, enable_dual],
+                        )
+
+                        refresh_align_btn.click(refresh_align_model_list, outputs=[align_model_manual])
+
+            with gr.Tab("批量处理（文件夹自动配对）"):
+                gr.Markdown("""
+                ### 文件夹自动配对
+                将音频文件（如 `.mp3`、`.wav`）和同名 `.txt` 文稿放在同一文件夹中，程序会自动匹配并批量生成字幕。
+                """)
+                batch_folder_input = gr.Textbox(label="文件夹路径", placeholder="例如：D:/my_audio_folder")
+                batch_status = gr.Textbox(label="批量处理状态", lines=8, interactive=False)
                 with gr.Row():
-                    status_box = gr.Textbox(label="任务状态", value="等待开始", lines=4, interactive=False)
-                    system_box = gr.Textbox(label="系统信息", value=get_system_status(), lines=4, interactive=False)
-
-                with gr.Accordion("模型与识别参数", open=True):
-                    model_drop = gr.Dropdown(label="ASR模型", choices=model_choices, value=model_choices[0] if model_choices else "medium")
-                    with gr.Row():
-                        device_drop = gr.Dropdown(label="设备", choices=["cuda", "cpu"], value="cuda" if torch.cuda.is_available() else "cpu")
-                        compute_drop = gr.Dropdown(label="计算类型", choices=["int8_float32", "float16", "float32"], value="int8_float32")
-                    with gr.Row():
-                        primary_lang = gr.Dropdown(label="主语言", choices=all_languages, value="zh")
-                        beam_slider = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)
-                    hotwords_box = gr.Textbox(label="热词/提示词", lines=2, value="")
-
-                with gr.Accordion("VAD 高级设置", open=False):
-                    vad_filter = gr.Checkbox(label="启用 VAD 过滤", value=True)
-                    vad_threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="语音检测阈值")
-                    vad_min_speech = gr.Slider(100, 1000, value=250, step=50, label="最短语音 (ms)")
-                    vad_min_silence = gr.Slider(50, 1000, value=100, step=50, label="最短静音 (ms)")
-
-                with gr.Accordion("对齐模型设置", open=True):
-                    align_sync_lang = gr.Checkbox(label="对齐模型跟随主语言自动匹配", value=True)
-                    align_model_manual = gr.Dropdown(label="手动选择对齐模型", choices=align_choices, value="无（使用默认）", visible=False)
-                    refresh_align_btn = gr.Button("刷新对齐模型列表", size="sm")
-                    align_granularity = gr.Radio(label="对齐粒度", choices=[("字符级", "char"), ("单词级", "word")], value="char")
-                    keep_align_loaded = gr.Checkbox(label="保持对齐模型加载", value=False)
-
-                with gr.Accordion("字幕合并规则", open=True):
-                    with gr.Row():
-                        merge_newline = gr.Checkbox(label="按空行分段(推荐)", value=True)
-                        merge_punc = gr.Checkbox(label="按标点断句", value=True)
-                        merge_silence = gr.Checkbox(label="按静音断句", value=True)
-                    with gr.Row():
-                        merge_wordcount = gr.Checkbox(label="按词数断句", value=True)
-                        merge_charcount = gr.Checkbox(label="按字符数断句", value=True)
-                        merge_duration = gr.Checkbox(label="按时长断句", value=True)
-                    with gr.Row():
-                        punc_box = gr.Textbox(label="句末标点", value="，；。！？,;.!?", scale=2)
-                        silence_slider = gr.Slider(0.1, 1.0, value=0.3, step=0.05, label="静音阈值 (秒)")
-                    with gr.Row():
-                        max_words_slider = gr.Slider(5, 50, value=20, step=1, label="最大词数")
-                        max_chars_slider = gr.Slider(5, 100, value=30, step=5, label="最大字符数")
-                        max_duration_slider = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="最大时长 (秒)")
-
-                with gr.Accordion("锚点增强 (中英实验性)", open=False):
-                    with gr.Row():
-                        anchor_start = gr.Checkbox(label="前锚点", value=False)
-                        anchor_end = gr.Checkbox(label="后锚点", value=False)
-                        anchor_mean = gr.Checkbox(label="前后均值", value=False)
-                        anchor_count_slider = gr.Slider(1, 5, value=3, step=1, label="锚点参考单位数")
-                    with gr.Row():
-                        anchor_density = gr.Checkbox(label="时间密度锚点", value=True, info="利用静音间隙抑制边界飘移")
-                    with gr.Row():
-                        density_min_gap_slider = gr.Slider(0.05, 0.5, value=0.18, step=0.01, label="密度最小间隙(秒)")
-                        density_boundary_window_slider = gr.Slider(1, 6, value=3, step=1, label="密度边界窗口(单位数)")
-
-                    gr.Markdown("---")
-                    gr.Markdown("### ⚠️ 实验性：段内规则细分")
-                    anchor_forced_linebreak = gr.Checkbox(
-                        label="📌 按规则对空行段落二次细分（实验性，可能切断词语）",
-                        value=False,
-                        info="先按空行分段，然后应用下方断句规则（标点/静音/字数/时长）对每段进行内部切分。注意：开启“按字符数断句”可能导致词语被切断，建议仅配合标点/静音使用。"
-                    )
-
-                with gr.Accordion("输出控制", open=False):
-                    with gr.Row():
-                        open_output_btn = gr.Button("打开输出目录", variant="secondary")
-                        max_text_len_slider = gr.Slider(2000, 50000, value=current_max_output_length, step=2000, label="界面最大显示字符数")
-                    open_output_btn.click(open_output_folder, inputs=None, outputs=None)
-                    max_text_len_slider.change(set_max_length, inputs=[max_text_len_slider], outputs=[system_box])
-
-                with gr.Row():
-                    run_btn = gr.Button("开始对齐", variant="primary", size="lg")
-                    clear_btn = gr.Button("清空")
-
-                with gr.Tabs():
-                    with gr.Tab("逐词/逐字 SRT"):
-                        word_output = gr.Textbox(label="逐词字幕", lines=20, show_copy_button=True)
-                    with gr.Tab("整句 SRT"):
-                        sent_output = gr.Textbox(label="整句字幕", lines=20, show_copy_button=True)
-                    with gr.Tab("合并字幕"):
-                        merged_output = gr.Textbox(label="合并字幕", lines=20, show_copy_button=True)
-                    with gr.Tab("锚点增强 SRT"):
-                        anchor_output = gr.Textbox(label="锚点增强字幕", lines=20, show_copy_button=True)
-                    with gr.Tab("副文稿单语 SRT"):
-                        secondary_output = gr.Textbox(label="副文稿字幕", lines=20, show_copy_button=True)
-                    with gr.Tab("双语 SRT"):
-                        dual_output = gr.Textbox(label="双语字幕", lines=20, show_copy_button=True)
-
-        def update_audio_preview(file_path):
-            if file_path:
-                return gr.update(value=file_path, visible=True)
-            return gr.update(value=None, visible=False)
-        audio_input.change(update_audio_preview, inputs=[audio_input], outputs=[audio_preview])
-        align_sync_lang.change(toggle_align_model_manual, inputs=[align_sync_lang], outputs=[align_model_manual])
-
-        run_btn.click(
-            run_alignment,
-            inputs=[
-                audio_input, primary_text, secondary_text, secondary_lang, enable_dual,
-                model_drop, device_drop, compute_drop, primary_lang, beam_slider,
-                vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
-                hotwords_box, align_sync_lang, align_model_manual, align_granularity,
-                punc_box, max_words_slider, max_chars_slider, max_duration_slider,
-                silence_slider, merge_punc, merge_silence,
-                merge_wordcount, merge_charcount, merge_duration,
-                merge_newline, keep_align_loaded,
-                force_preprocess_check,
-                anchor_start, anchor_end, anchor_mean, anchor_count_slider,
-                anchor_density, anchor_forced_linebreak,
-                density_min_gap_slider, density_boundary_window_slider, gr.State(2),
-            ],
-            outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_box],
-        )
-
-        clear_btn.click(
-            clear_outputs,
-            outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_box],
-        ).then(
-            lambda: [None, None, "", "", "", False],
-            outputs=[audio_input, audio_preview, primary_text, secondary_text, secondary_lang, enable_dual],
-        )
-
-        refresh_align_btn.click(refresh_align_model_list, outputs=[align_model_manual])
+                    batch_run_btn = gr.Button("开始批量处理", variant="primary")
+                    batch_clear_btn = gr.Button("清空")
+                
+                batch_run_btn.click(
+                    batch_folder_align,
+                    inputs=[
+                        batch_folder_input,
+                        secondary_text, secondary_lang, enable_dual,
+                        model_drop, device_drop, compute_drop, primary_lang, beam_slider,
+                        vad_filter, vad_threshold, vad_min_speech, vad_min_silence,
+                        hotwords_box, align_sync_lang, align_model_manual, align_granularity,
+                        punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+                        silence_slider, merge_punc, merge_silence,
+                        merge_wordcount, merge_charcount, merge_duration,
+                        merge_newline, keep_align_loaded,
+                        force_preprocess_check,
+                        anchor_start, anchor_end, anchor_mean, anchor_count_slider,
+                        anchor_density, anchor_forced_linebreak,
+                        density_min_gap_slider, density_boundary_window_slider
+                    ],
+                    outputs=[batch_status]
+                )
+                batch_clear_btn.click(lambda: ("", ""), outputs=[batch_folder_input, batch_status])
 
         gr.HTML("""
         <div style="text-align: center; color: #666; font-size: 0.85em; margin-top: 20px;">
