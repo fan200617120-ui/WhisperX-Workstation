@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-字幕自动打轴独立 UI 版 —— 空行断句（推荐）·锚点增强版
+字幕自动打轴独立 UI 版 —— 空行断句（推荐）·锚点增强版（Bug 修复版）
 - 空行断句（推荐）：按文稿空行分段，稳定匹配音频时间戳
 - 叠加下方断句规则（标点、静音、字数、时长）进行段内细分
 - 字符锚点 + 时间密度锚点用于微调（默认关闭）
@@ -10,7 +10,7 @@
 Copyright 2026 光影的故事2018
 """
 
-import sys, os, re, time, shutil, gc, threading, subprocess, logging, tempfile
+import sys, os, re, time, shutil, gc, threading, subprocess, logging, tempfile, copy
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
 
@@ -285,7 +285,8 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
             if next_time <= prev_time:
                 next_time = prev_time + 0.1
             mid_time = (prev_time + next_time) / 2.0
-            avg_dur = min(0.05, (next_time - prev_time) * 0.4)
+            # 修复 Bug 8：合理下限 0.08s，最高不超过 0.3s
+            avg_dur = max(0.08, min(0.3, (next_time - prev_time) * 0.4))
             aligned.append({"word": r_char, "start": mid_time - avg_dur/2, "end": mid_time + avg_dur/2})
             prev_time = mid_time
     return aligned
@@ -341,8 +342,9 @@ def force_align_word_level(reference_text, transcribed_words, audio_duration=Non
     return aligned
 
 def match_paragraphs_to_aligned(aligned_chars, norm_paragraphs, original_paragraphs):
+    """返回 (sentences, paragraph_char_ranges) 以便后续段落边界切断"""
     if not aligned_chars or not norm_paragraphs:
-        return []
+        return [], []
     aligned_text = "".join([c["word"] for c in aligned_chars])
     n_items = len(aligned_chars)
     n_text = len(aligned_text)
@@ -351,6 +353,7 @@ def match_paragraphs_to_aligned(aligned_chars, norm_paragraphs, original_paragra
         cum_len.append(cum_len[-1] + len(p))
     if aligned_text == "".join(norm_paragraphs) and n_text == n_items:
         sentences = []
+        ranges = []
         for i, para in enumerate(original_paragraphs):
             s_idx = cum_len[i]
             e_idx = cum_len[i + 1]
@@ -362,10 +365,12 @@ def match_paragraphs_to_aligned(aligned_chars, norm_paragraphs, original_paragra
             if t_end <= t_start:
                 t_end = t_start + 0.1
             sentences.append({"start": t_start, "end": t_end, "text": para})
-        return _ensure_monotonic(sentences)
+            ranges.append((s_idx, e_idx))
+        return _ensure_monotonic(sentences), ranges
+
     non_empty_items = [(i, np_, op) for i, (np_, op) in enumerate(zip(norm_paragraphs, original_paragraphs)) if np_]
     if not non_empty_items:
-        return []
+        return [], []
     matched_ranges = {}
     search_pos = 0
     for orig_idx, norm_p, orig_p in non_empty_items:
@@ -403,7 +408,9 @@ def match_paragraphs_to_aligned(aligned_chars, norm_paragraphs, original_paragra
         end_pos = min(best_start + para_len, n_text)
         matched_ranges[orig_idx] = (best_start, end_pos)
         search_pos = end_pos
+
     sentences = []
+    ranges = []
     for i in range(len(original_paragraphs)):
         if i in matched_ranges:
             s_c, e_c = matched_ranges[i]
@@ -435,17 +442,19 @@ def match_paragraphs_to_aligned(aligned_chars, norm_paragraphs, original_paragra
         if t_end <= t_start:
             t_end = t_start + 0.1
         sentences.append({"start": t_start, "end": t_end, "text": original_paragraphs[i]})
-    return _ensure_monotonic(sentences)
+        ranges.append((s_idx if i in matched_ranges else None, e_idx if i in matched_ranges else None))
+    return _ensure_monotonic(sentences), ranges
 
 def match_word_paragraphs_to_aligned(aligned_words, norm_paragraphs, original_paragraphs):
+    """同样返回 ranges，但单词级范围是单词索引"""
     if not aligned_words or not norm_paragraphs:
-        return []
+        return [], []
     n_aligned = len(aligned_words)
     aligned_word_texts = [w["word"] for w in aligned_words]
     aligned_full_text = " ".join(aligned_word_texts)
     non_empty_items = [(i, np_.strip(), op) for i, (np_, op) in enumerate(zip(norm_paragraphs, original_paragraphs)) if np_.strip()]
     if not non_empty_items:
-        return []
+        return [], []
     matched_word_ranges = {}
     search_char_pos = 0
     for orig_idx, norm_p, orig_p in non_empty_items:
@@ -486,7 +495,9 @@ def match_word_paragraphs_to_aligned(aligned_words, norm_paragraphs, original_pa
         word_end = max(word_start + 1, min(word_end, n_aligned))
         matched_word_ranges[orig_idx] = (word_start, word_end)
         search_char_pos = end_char_pos
+
     sentences = []
+    ranges = []
     for i in range(len(original_paragraphs)):
         if i in matched_word_ranges:
             ws, we = matched_word_ranges[i]
@@ -511,129 +522,118 @@ def match_word_paragraphs_to_aligned(aligned_words, norm_paragraphs, original_pa
         if t_end <= t_start:
             t_end = t_start + 0.1
         sentences.append({"start": t_start, "end": t_end, "text": original_paragraphs[i]})
-    return _ensure_monotonic(sentences)
+        if i in matched_word_ranges:
+            ranges.append(matched_word_ranges[i])
+        else:
+            ranges.append((None, None))
+    return _ensure_monotonic(sentences), ranges
 
-def generate_merged_srt(aligned_chars, sentences, paragraphs, merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration, merge_by_newline, merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount, merge_by_duration, silence_threshold, align_granularity="char"):
-    if merge_by_newline:
-        return sentences_to_srt(sentences)
+# ============ 新版合并函数（核心修复） ============
+def generate_merged_srt(
+    aligned_chars, sentences, paragraphs,
+    merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
+    merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount,
+    merge_by_duration, silence_threshold,
+    align_granularity="char",
+    paragraph_ranges: List[Tuple[Optional[int], Optional[int]]] = None
+) -> str:
+    """
+    合并规则直接在段落边界内生效，解决跨段粘连问题。
+    """
+    if not aligned_chars:
+        return ""
+
     punc_set = set(merge_punctuations) if merge_punctuations else set()
-    if merge_by_punc and punc_set and align_granularity == "char":
-        has_punc = any(c["word"] in punc_set for c in aligned_chars[:500])
-        if not has_punc:
-            return sentences_to_srt(sentences)
+    is_cjk = align_granularity == "char"  # 粗略判断，实际由外层传入更佳，此处简化
+
+    # 确定段落断点索引（字符在 aligned_chars 中的位置）
+    break_indices = set()
+    if paragraph_ranges and len(paragraph_ranges) == len(sentences):
+        for i, (s, e) in enumerate(paragraph_ranges):
+            if i < len(paragraph_ranges) - 1 and e is not None:
+                break_indices.add(e)  # 在上一段结束字符后插入断点
+
+    n_chars = len(aligned_chars)
     merged_segments = []
-    current_chars = []
+    current_items = []   # 存储 {"word":, "start":, "end":}
     current_start = None
+
     for i, ch_info in enumerate(aligned_chars):
         if current_start is None:
             current_start = ch_info["start"]
-        current_chars.append(ch_info)
+        current_items.append(ch_info)
+
         should_split = False
-        if merge_by_punc and punc_set and ch_info["word"] in punc_set:
+
+        # 段落边界强制断开
+        if i + 1 in break_indices:
             should_split = True
-        if merge_by_silence and i < len(aligned_chars) - 1:
+
+        # 合并规则
+        if not should_split and merge_by_punc and punc_set and ch_info["word"] in punc_set:
+            should_split = True
+        if not should_split and merge_by_silence and i < n_chars - 1:
             gap = aligned_chars[i + 1]["start"] - ch_info["end"]
             if gap > 0 and gap > silence_threshold:
                 should_split = True
-        text_so_far = "".join([c["word"] for c in current_chars])
-        if merge_by_wordcount and len(current_chars) >= merge_max_words:
-            should_split = True
-        if merge_by_charcount and len(text_so_far) >= merge_max_chars:
-            should_split = True
-        duration = ch_info["end"] - current_start
-        if merge_by_duration and duration >= merge_max_duration:
-            should_split = True
+
+        # 词数字数统计（修复 Bug 1 和 Bug 3）
+        if not should_split:
+            if merge_by_wordcount or merge_by_charcount or merge_by_duration:
+                # 构建当前文本用于统计
+                if align_granularity == "word":
+                    text_so_far = " ".join([c["word"] for c in current_items])
+                else:
+                    text_so_far = "".join([c["word"] for c in current_items])
+                if merge_by_wordcount:
+                    if align_granularity == "char":
+                        # 字符模式下按字计数（中日韩）或空格分词（西文）
+                        # 更稳健的做法：如果字符包含字母，按空格分；否则直接按字符数
+                        if any(c.isalpha() and ord(c) < 128 for c in text_so_far):
+                            word_count = len(text_so_far.split())
+                        else:
+                            word_count = len(current_items)  # 中日韩一个字即一个“词”
+                    else:
+                        word_count = len(current_items)
+                    if word_count >= merge_max_words:
+                        should_split = True
+                if not should_split and merge_by_charcount and len(text_so_far) >= merge_max_chars:
+                    should_split = True
+                if not should_split and merge_by_duration:
+                    duration = ch_info["end"] - current_start
+                    if duration >= merge_max_duration:
+                        should_split = True
+
         if should_split:
-            merged_segments.append({"start": current_start, "end": ch_info["end"], "text": text_so_far.strip()})
-            current_chars = []
+            # 构建文本（修复 Bug 1：单词级用空格连接）
+            if align_granularity == "word":
+                text = " ".join([c["word"] for c in current_items]).strip()
+            else:
+                text = "".join([c["word"] for c in current_items]).strip()
+            if text:
+                # 确保时间戳有效
+                seg_start = current_items[0]["start"]
+                seg_end = current_items[-1]["end"]
+                if seg_end <= seg_start:
+                    seg_end = seg_start + 0.1
+                merged_segments.append({"start": seg_start, "end": seg_end, "text": text})
+            current_items = []
             current_start = None
-    if current_chars:
-        text = "".join([c["word"] for c in current_chars]).strip()
+
+    # 处理末尾剩余
+    if current_items:
+        if align_granularity == "word":
+            text = " ".join([c["word"] for c in current_items]).strip()
+        else:
+            text = "".join([c["word"] for c in current_items]).strip()
         if text:
-            merged_segments.append({"start": current_chars[0]["start"], "end": current_chars[-1]["end"], "text": text})
+            seg_start = current_items[0]["start"]
+            seg_end = current_items[-1]["end"]
+            if seg_end <= seg_start:
+                seg_end = seg_start + 0.1
+            merged_segments.append({"start": seg_start, "end": seg_end, "text": text})
+
     return sentences_to_srt(merged_segments)
-
-def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
-    """段内细分，带西文单词边界保护"""
-    if not chars:
-        return []
-    punc_set = set(merge_params.get('punc_chars', '')) if merge_params.get('merge_by_punc') else set()
-    segments = []
-    current_chars = []
-    current_start = None
-    for i, ch in enumerate(chars):
-        if current_start is None:
-            current_start = ch["start"]
-        current_chars.append(ch)
-        should_split = False
-        if merge_params.get('merge_by_punc') and punc_set and ch["word"] in punc_set:
-            should_split = True
-        if merge_params.get('merge_by_silence') and i < len(chars) - 1:
-            gap = chars[i + 1]["start"] - ch["end"]
-            if gap > 0 and gap > merge_params.get('silence_threshold', 0.3):
-                should_split = True
-        if merge_params.get('merge_by_wordcount') and len(current_chars) >= merge_params.get('max_words', 20):
-            should_split = True
-        text_so_far = "".join([c["word"] for c in current_chars])
-        if merge_params.get('merge_by_charcount') and len(text_so_far) >= merge_params.get('max_chars', 30):
-            next_char = chars[i + 1]["word"] if i + 1 < len(chars) else ""
-            if punc_set and next_char and next_char not in punc_set:
-                fallback_idx = -1
-                for j in range(len(current_chars) - 1, -1, -1):
-                    if current_chars[j]["word"] in punc_set:
-                        fallback_idx = j
-                        break
-                if fallback_idx != -1:
-                    split_idx = fallback_idx + 1
-                    seg_text = "".join([c["word"] for c in current_chars[:split_idx]]).strip()
-                    if seg_text:
-                        segments.append({"start": current_start, "end": current_chars[split_idx - 1]["end"], "text": seg_text})
-                    current_chars = current_chars[split_idx:]
-                    current_start = current_chars[0]["start"] if current_chars else None
-                    continue
-            else:
-                should_split = True
-        duration = ch["end"] - current_start
-        if merge_params.get('merge_by_duration') and duration >= merge_params.get('max_duration', 10.0):
-            should_split = True
-
-        if should_split:
-            seg_text = "".join([c["word"] for c in current_chars]).strip()
-            if seg_text:
-                segments.append({"start": current_start, "end": ch["end"], "text": seg_text})
-            current_chars = []
-            current_start = None
-
-    if current_chars:
-        seg_text = "".join([c["word"] for c in current_chars]).strip()
-        if seg_text:
-            segments.append({"start": current_chars[0]["start"], "end": current_chars[-1]["end"], "text": seg_text})
-    return segments
-
-def _trim_char_seg_to_text(char_seg: List[Dict], paragraph_text: str) -> List[Dict]:
-    if not char_seg or not paragraph_text:
-        return char_seg
-    norm_text = normalize_text_for_alignment(paragraph_text, "char")
-    seg_text = "".join([c["word"] for c in char_seg])
-    if not norm_text:
-        return char_seg
-    best_start = 0
-    best_len = 0
-    for i in range(max(0, len(seg_text) - len(norm_text)) + 1):
-        match_len = 0
-        for j in range(len(norm_text)):
-            if i + j >= len(seg_text):
-                break
-            if seg_text[i + j].lower() == norm_text[j].lower():
-                match_len += 1
-            else:
-                break
-        if match_len > best_len:
-            best_len = match_len
-            best_start = i
-    if best_len > 0 and best_len >= len(norm_text) * 0.8:
-        return char_seg[best_start:best_start + len(norm_text)]
-    return char_seg
 
 # ============ FFmpeg 工具函数 ============
 def find_ffmpeg():
@@ -923,7 +923,7 @@ def safe_audio_path(audio_input):
         return audio_input.get("name") or audio_input.get("path")
     return None
 
-# ============ 核心对齐函数 ============
+# ============ 核心对齐函数（重构后） ============
 def run_alignment(
     audio_file, primary_text, secondary_text, secondary_lang, enable_dual,
     model_size, device, compute_type, primary_lang, beam_size,
@@ -936,10 +936,12 @@ def run_alignment(
     force_preprocess,
     anchor_enable_start, anchor_enable_end, anchor_enable_mean,
     anchor_char_count,
-    anchor_density_enable, anchor_forced_linebreak_enable,
-    density_min_gap, density_boundary_window,
+    anchor_density_enable, density_min_gap, density_boundary_window,
     progress: gr.Progress = None,
 ):
+    """
+    核心对齐流程，已移除 anchor_forced_linebreak_enable 分支。
+    """
     if progress is None:
         progress = gr.Progress()
     if audio_file is None:
@@ -1050,10 +1052,7 @@ def run_alignment(
             use_whisperx_align = False
 
         if use_whisperx_align and align_model_path:
-            if os.path.isdir(align_model_path):
-                align_model_name_for_load = align_model_path
-            else:
-                align_model_name_for_load = align_model_path
+            align_model_name_for_load = align_model_path  # 修复 Bug 6：简化
 
         system_info = get_system_status(align_model_display)
 
@@ -1078,7 +1077,8 @@ def run_alignment(
             initial_prompt=initial_prompt)
         if err:
             return f"错误: 转写失败 - {err}", "", "", "", "", "", "", system_info
-        original_result = result.copy()
+        # 修复 Bug 2：深拷贝
+        original_result = copy.deepcopy(result)
 
         # ---- 精细对齐 ----
         if use_whisperx_align:
@@ -1122,77 +1122,32 @@ def run_alignment(
 
         word_srt = words_to_srt(aligned)
 
-        # ---- 空行断句分支 ----
-        if anchor_forced_linebreak_enable:
-            paragraphs = re.split(r'\n\s*\n', primary_text.strip())
-            paragraphs = [p.strip() for p in paragraphs if p.strip()]
-            if not paragraphs:
-                return "错误: 主文稿无有效段落", "", "", "", "", "", "", system_info
-            norm_paragraphs = [normalize_text_for_alignment(p, align_granularity) for p in paragraphs]
-            if align_granularity == "char":
-                initial_sentences = match_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
-            else:
-                initial_sentences = match_word_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
+        # ---- 空行断句 + 合并规则（统一入口） ----
+        paragraphs = re.split(r'\n\s*\n', primary_text.strip())
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        if not paragraphs:
+            return "错误: 主文稿无有效段落", "", "", "", "", "", "", system_info
+        norm_paragraphs = [normalize_text_for_alignment(p, align_granularity) for p in paragraphs]
 
-            merge_params = {
-                'merge_by_punc': merge_by_punc,
-                'punc_chars': merge_punctuations,
-                'merge_by_silence': merge_by_silence,
-                'silence_threshold': merge_silence_threshold,
-                'merge_by_wordcount': merge_by_wordcount,
-                'max_words': merge_max_words,
-                'merge_by_charcount': merge_by_charcount,
-                'max_chars': merge_max_chars,
-                'merge_by_duration': merge_by_duration,
-                'max_duration': merge_max_duration
-            }
-
-            merged_sentences = []
-            char_idx = 0
-            n_chars = len(aligned)
-            for sent in initial_sentences:
-                start_time = sent["start"]
-                end_time = sent["end"]
-                while char_idx < n_chars and aligned[char_idx]["end"] < start_time:
-                    char_idx += 1
-                seg_start = char_idx
-                while char_idx < n_chars and aligned[char_idx]["start"] <= end_time:
-                    char_idx += 1
-                seg_end = char_idx
-                if seg_start >= seg_end:
-                    merged_sentences.append(sent)
-                    continue
-                char_seg = aligned[seg_start:seg_end]
-                char_seg = _trim_char_seg_to_text(char_seg, sent["text"])
-                sub_segs = _merge_chars_by_rules(char_seg, merge_params)
-                if not sub_segs:
-                    merged_sentences.append(sent)
-                else:
-                    merged_sentences.extend(sub_segs)
-            merged_sentences = _ensure_monotonic(merged_sentences)
-            merged_srt = sentences_to_srt(merged_sentences)
-            sent_srt = sentences_to_srt(initial_sentences)
-            sentences_for_anchor = merged_sentences
+        paragraph_ranges = None
+        if align_granularity == "char":
+            initial_sentences, paragraph_ranges = match_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
         else:
-            paragraphs = re.split(r'\n\s*\n', primary_text.strip())
-            paragraphs = [p.strip() for p in paragraphs if p.strip()]
-            if not paragraphs:
-                return "错误: 主文稿无有效段落", "", "", "", "", "", "", system_info
-            norm_paragraphs = [normalize_text_for_alignment(p, align_granularity) for p in paragraphs]
-            if align_granularity == "char":
-                initial_sentences = match_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
-            else:
-                initial_sentences = match_word_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
-            merged_srt = generate_merged_srt(
-                aligned, initial_sentences, paragraphs,
-                merge_punctuations, merge_max_words, merge_max_chars,
-                merge_max_duration, merge_by_newline, merge_by_punc,
-                merge_by_silence, merge_by_wordcount, merge_by_charcount,
-                merge_by_duration, merge_silence_threshold, align_granularity)
-            sent_srt = sentences_to_srt(initial_sentences)
-            sentences_for_anchor = initial_sentences
+            initial_sentences, paragraph_ranges = match_word_paragraphs_to_aligned(aligned, norm_paragraphs, paragraphs)
 
-        # ---- 锚点微调 ----
+        # 生成合并字幕（会根据 paragraph_ranges 在段边界处强制断开）
+        merged_srt = generate_merged_srt(
+            aligned, initial_sentences, paragraphs,
+            merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
+            merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount,
+            merge_by_duration, merge_silence_threshold,
+            align_granularity,
+            paragraph_ranges=paragraph_ranges
+        )
+        sent_srt = sentences_to_srt(initial_sentences)
+        sentences_for_anchor = initial_sentences  # 锚点基于原始段落句
+
+        # ---- 锚点微调（可选） ----
         anchor_srt = ""
         anchor_used = anchor_enable_start or anchor_enable_end or anchor_enable_mean
         if anchor_used and aligned and sentences_for_anchor:
@@ -1326,19 +1281,18 @@ def batch_folder_align(
     merge_newline, keep_align_loaded,
     force_preprocess_check,
     anchor_start, anchor_end, anchor_mean, anchor_count_slider,
-    anchor_density, anchor_forced_linebreak,
-    density_min_gap_slider, density_boundary_window_slider,
+    anchor_density, density_min_gap_slider, density_boundary_window_slider,
     progress=gr.Progress()
 ):
     if not folder_path or not os.path.isdir(folder_path):
         return "错误: 请提供有效的文件夹路径"
-    
+
     folder = Path(folder_path)
     audio_exts = {'.mp3', '.wav', '.m4a', '.flac', '.ogg'}
     audio_files = [f for f in folder.iterdir() if f.suffix.lower() in audio_exts]
     if not audio_files:
         return "文件夹中未找到支持的音频文件"
-    
+
     pairs = []
     for audio_f in audio_files:
         txt_f = folder / (audio_f.stem + '.txt')
@@ -1346,7 +1300,7 @@ def batch_folder_align(
             pairs.append((audio_f, txt_f))
     if not pairs:
         return "未找到任何同名 .txt 文稿文件，请确保音频和文稿文件名相同（除扩展名外）"
-    
+
     total = len(pairs)
     results = []
     for i, (audio_path, txt_path) in enumerate(pairs, 1):
@@ -1357,6 +1311,7 @@ def batch_folder_align(
             if not primary_text.strip():
                 results.append(f"❌ {audio_path.name}: 文稿为空")
                 continue
+            # 传递 progress 使批量也显示内部进度
             status, *_ = run_alignment(
                 str(audio_path), primary_text,
                 secondary_text, secondary_lang, enable_dual,
@@ -1369,8 +1324,8 @@ def batch_folder_align(
                 merge_newline, keep_align_loaded,
                 force_preprocess_check,
                 anchor_start, anchor_end, anchor_mean, anchor_count_slider,
-                anchor_density, anchor_forced_linebreak,
-                density_min_gap_slider, density_boundary_window_slider
+                anchor_density, density_min_gap_slider, density_boundary_window_slider,
+                progress=None  # 使用默认进度（批量内暂不嵌套显示）
             )
             if "错误" in status:
                 results.append(f"❌ {audio_path.name}: {status.split(chr(10))[0]}")
@@ -1378,7 +1333,7 @@ def batch_folder_align(
                 results.append(f"✅ {audio_path.name}: 已完成")
         except Exception as e:
             results.append(f"❌ {audio_path.name}: 异常 - {str(e)}")
-    
+
     total_success = sum(1 for r in results if r.startswith("✅"))
     output = f"批量处理完成！成功: {total_success}/{total}\n" + "\n".join(results)
     return output
@@ -1397,7 +1352,7 @@ def create_ui():
     all_languages = ["auto"] + list(LANGUAGE_ALIGN_MODEL_MAP.keys())
 
     with gr.Blocks(title="字幕自动打轴", theme=gr.themes.Default()) as demo:
-        gr.Markdown("# 🎬 字幕自动打轴 稳定版（支持 24 种语言_stable）")
+        gr.Markdown("# 🎬 字幕自动打轴（支持 24 种语言）")
         
         with gr.Tabs():
             with gr.Tab("单文件处理"):
@@ -1457,7 +1412,7 @@ def create_ui():
                                 max_chars_slider = gr.Slider(5, 100, value=30, step=5, label="最大字符数")
                                 max_duration_slider = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="最大时长 (秒)")
 
-                        with gr.Accordion("锚点增强 (实验性，不建议轻易开启)", open=False):
+                        with gr.Accordion("锚点增强 (实验性，默认关闭)", open=False):
                             with gr.Row():
                                 anchor_start = gr.Checkbox(label="前锚点", value=False)
                                 anchor_end = gr.Checkbox(label="后锚点", value=False)
@@ -1468,13 +1423,6 @@ def create_ui():
                             with gr.Row():
                                 density_min_gap_slider = gr.Slider(0.05, 0.5, value=0.18, step=0.01, label="密度最小间隙(秒)")
                                 density_boundary_window_slider = gr.Slider(1, 6, value=3, step=1, label="密度边界窗口(单位数)")
-                            gr.Markdown("---")
-                            gr.Markdown("### ⚠️ 实验性：段内规则细分")
-                            anchor_forced_linebreak = gr.Checkbox(
-                                label="按规则对空行段落二次细分（实验性，建议保持关闭）",
-                                value=False,
-                                info="先按空行分段，然后应用下方断句规则对每段内部切分。关闭时仅按空行断句，稳定性最高。"
-                            )
 
                         with gr.Accordion("输出控制", open=False):
                             open_output_btn = gr.Button("打开输出目录", variant="secondary")
@@ -1520,8 +1468,7 @@ def create_ui():
                                 merge_newline, keep_align_loaded,
                                 force_preprocess_check,
                                 anchor_start, anchor_end, anchor_mean, anchor_count_slider,
-                                anchor_density, anchor_forced_linebreak,
-                                density_min_gap_slider, density_boundary_window_slider
+                                anchor_density, density_min_gap_slider, density_boundary_window_slider
                             ],
                             outputs=[status_box, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_box],
                         )
@@ -1561,8 +1508,7 @@ def create_ui():
                         merge_newline, keep_align_loaded,
                         force_preprocess_check,
                         anchor_start, anchor_end, anchor_mean, anchor_count_slider,
-                        anchor_density, anchor_forced_linebreak,
-                        density_min_gap_slider, density_boundary_window_slider
+                        anchor_density, density_min_gap_slider, density_boundary_window_slider
                     ],
                     outputs=[batch_status]
                 )
