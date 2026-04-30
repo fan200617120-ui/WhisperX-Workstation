@@ -258,20 +258,23 @@ def force_align_char_level(reference_text, transcribed_words, audio_duration=Non
             w_idx = char_to_word_idx[matched_hyp_idx]
             start_t = transcribed_words[w_idx]["start"]
             end_t = transcribed_words[w_idx]["end"]
+            # 计算当前字符在单词中的位置（前方字符数）
             count_in_word = 1
-            total_in_word = 1
             for j in range(i - 1, -1, -1):
                 if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
                     count_in_word += 1
                 else:
                     break
+            # 计算从当前字符到单词结尾的字符数（包含当前字符）
+            remain_in_word = 1
             for j in range(i + 1, len(ref_chars)):
                 if match_map[j] != -1 and match_map[j] < len(char_to_word_idx) and char_to_word_idx[match_map[j]] == w_idx:
-                    total_in_word += 1
+                    remain_in_word += 1
                 else:
                     break
+            total_chars_in_word = count_in_word + remain_in_word - 1   # 修复：单词总字符数
             word_duration = end_t - start_t
-            char_duration = max(word_duration / total_in_word, 0.02) if total_in_word > 0 else 0.02
+            char_duration = max(word_duration / total_chars_in_word, 0.02) if total_chars_in_word > 0 else 0.02
             char_start = start_t + (count_in_word - 1) * char_duration
             char_end = char_start + char_duration
             aligned.append({"word": r_char, "start": char_start, "end": char_end})
@@ -622,6 +625,37 @@ def _merge_chars_by_rules(chars: List[Dict], merge_params: dict) -> List[Dict]:
             segments.append({"start": current_chars[0]["start"], "end": current_chars[-1]["end"], "text": seg_text})
     return segments
 
+def _trim_char_seg_to_text(char_seg: List[Dict], paragraph_text: str) -> List[Dict]:
+    """
+    将字符片段裁剪到与规范化段落文本匹配的子段，防止包含相邻段落的字符。
+    """
+    if not char_seg or not paragraph_text:
+        return char_seg
+    # 规范化段落文本并与字符片段文本比对
+    norm_text = normalize_text_for_alignment(paragraph_text, "char")
+    seg_text = "".join([c["word"] for c in char_seg])
+    if not norm_text:
+        return char_seg
+    # 寻找最长前缀匹配
+    best_start = 0
+    best_len = 0
+    for i in range(max(0, len(seg_text) - len(norm_text)) + 1):
+        match_len = 0
+        for j in range(len(norm_text)):
+            if i + j >= len(seg_text):
+                break
+            if seg_text[i + j].lower() == norm_text[j].lower():
+                match_len += 1
+            else:
+                break
+        if match_len > best_len:
+            best_len = match_len
+            best_start = i
+    # 必须匹配至少80%以上才采纳裁剪
+    if best_len > 0 and best_len >= len(norm_text) * 0.8:
+        return char_seg[best_start:best_start + len(norm_text)]
+    return char_seg
+
 # ============ FFmpeg 等保持不变 ============
 def find_ffmpeg():
     portable_dir = PROJECT_ROOT / "ffmpeg" / "bin"
@@ -874,7 +908,8 @@ def extract_words_from_result(result, align_granularity, use_whisperx_align):
         for i, w in enumerate(seg_words):
             if use_whisperx_align and align_granularity == "char" and "chars" in w:
                 chars_list = w["chars"]
-                valid_chars = [c for c in chars_list if "char" in c]
+                # 过滤空白字符，防止空格影响对齐
+                valid_chars = [c for c in chars_list if "char" in c and c["char"].strip() != ""]
                 if not valid_chars:
                     words.append({"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)})
                     continue
@@ -959,12 +994,13 @@ def run_alignment(
                 except Exception:
                     pass
 
-        # ---- 对齐模型选择（离线优先） ----
+        # ---- 对齐模型选择（离线优先），修复 align_model_path 未初始化问题 ----
         local_align_models = manager.get_local_align_models()
         use_whisperx_align = False
         align_model_name_for_load = None
         align_model_dir_for_load = str(ALIGN_CACHE_DIR)
         align_model_display = ""
+        align_model_path = None   # 关键修复：变量初始化
 
         def match_local_by_lang(lang: str) -> Optional[str]:
             lang = lang.strip().lower()
@@ -972,7 +1008,6 @@ def run_alignment(
                 d = disp.lower()
                 if re.search(rf'(?:^|[_-]){re.escape(lang)}(?:[_-]|$)', d):
                     return path
-            # 扩展语言关键词，便于本地离线匹配
             lang_map = {
                 "zh": ["chinese", "mandarin"],
                 "en": ["english"],
@@ -1148,6 +1183,8 @@ def run_alignment(
                     merged_sentences.append(sent)
                     continue
                 char_seg = aligned[seg_start:seg_end]
+                # 关键修复：用段落文本修正字符片段，防止包含相邻段落字符
+                char_seg = _trim_char_seg_to_text(char_seg, sent["text"])
                 sub_segs = _merge_chars_by_rules(char_seg, merge_params)
                 if not sub_segs:
                     merged_sentences.append(sent)
@@ -1297,7 +1334,7 @@ def set_max_length(val):
     current_max_output_length = int(val)
     return get_system_status()
 
-# ============ 界面 ============
+# ============ 界面（保持原布局） ============
 def create_ui():
     local_models = manager.get_local_models()
     model_choices = [name for name, _ in local_models]
@@ -1309,7 +1346,6 @@ def create_ui():
     local_align = manager.get_local_align_models()
     align_choices = ["无（使用默认）"] + [disp for disp, _ in local_align]
 
-    # 所有支持的语言选项
     all_languages = ["auto"] + list(LANGUAGE_ALIGN_MODEL_MAP.keys())
 
     with gr.Blocks(title="字幕自动打轴", theme=gr.themes.Default()) as demo:
@@ -1354,7 +1390,6 @@ def create_ui():
                     align_granularity = gr.Radio(label="对齐粒度", choices=[("字符级", "char"), ("单词级", "word")], value="char")
                     keep_align_loaded = gr.Checkbox(label="保持对齐模型加载", value=False)
 
-                # 字幕合并规则
                 with gr.Accordion("字幕合并规则", open=True):
                     with gr.Row():
                         merge_newline = gr.Checkbox(label="按空行分段(推荐)", value=True)
@@ -1372,7 +1407,6 @@ def create_ui():
                         max_chars_slider = gr.Slider(5, 100, value=30, step=5, label="最大字符数")
                         max_duration_slider = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="最大时长 (秒)")
 
-                # 锚点增强
                 with gr.Accordion("锚点增强 (中英实验性)", open=False):
                     with gr.Row():
                         anchor_start = gr.Checkbox(label="前锚点", value=False)
