@@ -44,12 +44,15 @@ BASE_DIR = CURRENT_DIR
 ROOT_DIR = PROJECT_ROOT
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output"
 OUTPUT_DIR = DEFAULT_OUTPUT_DIR
-# 提前创建输出目录（修复 Bug 8）
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PRESET_DIR = ROOT_DIR / "preset"
 PRESET_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = PRESET_DIR / "settings.json"
 config_lock = threading.RLock()
+
+# 临时文件统一存放目录
+CACHE_DIR = ROOT_DIR / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
 # ==================== FFmpeg ====================
 PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
@@ -106,16 +109,21 @@ DEFAULT_MAX_OUTPUT_LENGTH = 5000
 current_max_output_length = DEFAULT_MAX_OUTPUT_LENGTH
 
 def safe_text(text: str, max_len: int = None) -> str:
-    """对纯文本/日志进行截断，但对 JSON/SRT 等结构化内容限制整个输出框的展示度，不破坏结构。"""
+    """对纯文本/日志进行截断，但对 JSON/SRT 等结构化内容按条目截断，不破坏结构。"""
     if max_len is None:
-        max_len = current_max_output_length
+        with config_lock:
+            max_len = current_max_output_length
     if not isinstance(text, str):
         return str(text)
     if len(text) > max_len:
         if text.strip().startswith("[") or text.strip().startswith("{"):
             return text[:max_len] + "\n\n[注意] 返回的 JSON 过长已截断，完整结果已保存至输出目录。"
+        # 如果是 SRT 格式，按最后一个完整空行截断
         if re.match(r'^\d+\n', text):
-            return text[:max_len] + "\n\n[注意] 返回的 SRT 过长已截断，完整结果已保存至输出目录。"
+            last_complete = text[:max_len].rfind('\n\n')
+            if last_complete > 0:
+                return text[:last_complete] + "\n\n[注意] SRT 过长已截断，完整结果已保存至输出目录。"
+            return text[:max_len] + "\n\n[注意] SRT 过长已截断，完整结果已保存至输出目录。"
         return text[:max_len] + "\n\n[注意] 返回内容过长已截断，完整结果已保存至输出目录。"
     return text
 
@@ -155,7 +163,6 @@ def split_long_segments(segments,
         words = seg.get('words', [])
         # --- 静音分割 ---
         if enable_silence_split and words and max_silence_ms is not None:
-            # 收集静音间隙边界，将 segment 切分为多个子段
             sub_segments_times = []
             last_end = start
             sub_start = start
@@ -166,7 +173,6 @@ def split_long_segments(segments,
                         sub_segments_times.append((sub_start, last_end))
                     sub_start = w_start
                 last_end = max(last_end, w.get('end', w_start))
-            # 最后一段
             if sub_start < end:
                 sub_segments_times.append((sub_start, end))
             if not sub_segments_times:
@@ -174,18 +180,13 @@ def split_long_segments(segments,
         else:
             sub_segments_times = [(start, end)]
 
-        # 对每个子段（已按静音切分）应用时长/字数分割
         for sub_start, sub_end in sub_segments_times:
             sub_duration = sub_end - sub_start
             if sub_duration <= 0:
                 continue
-            # 提取该子段内的单词
             sub_words = [w for w in words if w.get('start', 0) >= sub_start and w.get('end', 0) <= sub_end + 1e-4]
-            # 计算该子段内的文本
             sub_text = " ".join([w['word'] for w in sub_words]) if sub_words else ""
-            # 如果只是时间片段但没有单词，用原文本（按比例分割）
             if not sub_text:
-                # 简单按时间比例截取原始文本（不够精确但保证不崩溃）
                 total_duration = end - start
                 ratio_start = (sub_start - start) / total_duration if total_duration > 0 else 0
                 ratio_end = (sub_end - start) / total_duration if total_duration > 0 else 1
@@ -193,7 +194,6 @@ def split_long_segments(segments,
                 end_char = int(ratio_end * len(text))
                 sub_text = text[start_char:end_char].strip()
                 sub_words = []
-            # 再对子段应用时长/字数分割
             splitted = _split_by_time_and_chars(
                 sub_text, sub_start, sub_end, sub_words,
                 enable_duration_split, max_duration,
@@ -203,7 +203,7 @@ def split_long_segments(segments,
     return new_segments
 
 def _split_by_punc(segments, punc_set):
-    """按标点符号拆分句子，同时保持时间戳。"""
+    """按标点符号拆分句子，同时保留 words 字段。"""
     result = []
     for seg in segments:
         text = seg['text']
@@ -212,6 +212,7 @@ def _split_by_punc(segments, punc_set):
             continue
         start = seg['start']
         end = seg['end']
+        words = seg.get('words', [])
         duration = end - start
         char_dur = duration / len(text) if len(text) > 0 else 0
         sub_texts = re.split(f'([{re.escape("".join(punc_set))}])', text)
@@ -224,29 +225,40 @@ def _split_by_punc(segments, punc_set):
             if part and part[-1] in punc_set:
                 if current.strip():
                     end_idx = current_start_idx + len(current)
+                    sub_start = start + current_start_idx * char_dur
                     sub_end = start + end_idx * char_dur
                     if sub_end > end:
                         sub_end = end
-                    result.append({
-                        'start': start + current_start_idx * char_dur,
-                        'end': sub_end,
-                        'text': current.strip()
-                    })
+                    # 分配 words
+                    sub_words = []
+                    if words:
+                        for w in words:
+                            w_start = w.get('start', 0)
+                            if w_start >= sub_start - 1e-4 and w_start < sub_end + 1e-4:
+                                sub_words.append(w)
+                    new_seg = {'start': sub_start, 'end': sub_end, 'text': current.strip()}
+                    if sub_words:
+                        new_seg['words'] = sub_words
+                    result.append(new_seg)
                 current_start_idx += len(current)
                 current = ""
         if current.strip():
-            sub_end = end
-            result.append({
-                'start': start + current_start_idx * char_dur,
-                'end': sub_end,
-                'text': current.strip()
-            })
+            sub_start = start + current_start_idx * char_dur
+            sub_words = []
+            if words:
+                for w in words:
+                    w_start = w.get('start', 0)
+                    if w_start >= sub_start - 1e-4:
+                        sub_words.append(w)
+            new_seg = {'start': sub_start, 'end': end, 'text': current.strip()}
+            if sub_words:
+                new_seg['words'] = sub_words
+            result.append(new_seg)
     return result
 
 def _split_by_time_and_chars(text, start, end, words,
                              enable_duration_split, max_duration,
                              enable_char_split, max_chars):
-    """根据时长和字数限制进一步分割一个句子片段。"""
     duration = end - start
     char_count = len(text)
     need_split = False
@@ -257,14 +269,12 @@ def _split_by_time_and_chars(text, start, end, words,
     if not need_split or duration <= 0 or char_count == 0:
         return [{'start': start, 'end': end, 'text': text.strip(), 'words': words}]
 
-    # 计算分割份数
     num_splits = 1
     if enable_duration_split and max_duration is not None:
         num_splits = max(num_splits, math.ceil(duration / max_duration))
     if enable_char_split and max_chars is not None:
         num_splits = max(num_splits, math.ceil(char_count / max_chars))
 
-    # 改为按词数均匀分割，避免字符索引混乱（修复 Bug 2）
     if words and len(words) > 1:
         words_per_seg = math.ceil(len(words) / num_splits)
         result = []
@@ -283,7 +293,6 @@ def _split_by_time_and_chars(text, start, end, words,
             })
         return result
     else:
-        # 无单词信息时按时间均分，文本按比例截取（兜底）
         time_per_seg = duration / num_splits
         chars_per_seg = math.ceil(char_count / num_splits)
         result = []
@@ -303,10 +312,6 @@ def _split_by_time_and_chars(text, start, end, words,
         return result
 
 def format_result_to_outputs(result, **kwargs):
-    """
-    将原始识别结果转换为文本、JSON、SRT。
-    断句参数通过关键字传入，内部调用 split_long_segments。
-    """
     if not result or not isinstance(result, dict):
         return "无结果", "{}", "", []
 
@@ -322,13 +327,28 @@ def format_result_to_outputs(result, **kwargs):
         punc_set=set(kwargs.get('punc_chars', '')) if kwargs.get('enable_punc_split') else None
     )
 
+    def clean_cjk_spaces(text):
+        if re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text):
+            return re.sub(r'\s+', '', text)
+        return text
+
+    cleaned_segments = []
+    for seg in segments:
+        seg_cp = seg.copy()
+        seg_cp['text'] = clean_cjk_spaces(seg['text'])
+        # 同时清理 words 字段中的 word（若存在）
+        if 'words' in seg_cp:
+            for w in seg_cp['words']:
+                w['word'] = clean_cjk_spaces(w['word'])
+        cleaned_segments.append(seg_cp)
+
     has_cjk = any(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', seg.get("text", ""))
-                  for seg in segments)
+                  for seg in cleaned_segments)
     join_char = "" if has_cjk else " "
-    text = join_char.join([seg["text"] for seg in segments])
-    ts_json = json.dumps(segments, ensure_ascii=False, indent=2)
+    text = join_char.join([seg["text"] for seg in cleaned_segments])
+    ts_json = json.dumps(cleaned_segments, ensure_ascii=False, indent=2)
     srt = []
-    for i, seg in enumerate(segments, 1):
+    for i, seg in enumerate(cleaned_segments, 1):
         srt.append(str(i))
         srt.append(f"{seconds_to_srt_time(seg['start'])} --> {seconds_to_srt_time(seg['end'])}")
         srt.append(seg["text"])
@@ -336,9 +356,9 @@ def format_result_to_outputs(result, **kwargs):
     srt_text = "\n".join(srt)
     extra = f"语言: {result.get('language','未知')} (概率: {result.get('language_probability',0):.2f})"
     full = f"{text}\n\n[元数据] {extra}"
-    return full, ts_json, srt_text, segments
+    return full, ts_json, srt_text, cleaned_segments
 
-def save_outputs(base_name, full_text, ts_json, srt_text, language, model_info):
+def save_outputs(base_name, full_text, ts_json, srt_text, language):
     ts = time.strftime("%Y%m%d_%H%M%S")
     try:
         original_stem = Path(base_name).stem
@@ -433,19 +453,16 @@ class WhisperXManager:
 
     def load_asr_model(self, model_size, device, compute_type, language=None):
         with self.lock:
-            # 优先使用本地路径（修复硬编码 Bug）
             local_path = ROOT_DIR / "pretrained_models" / model_size
             if local_path.exists() and ((local_path / "model.bin").exists() or (local_path / "config.json").exists()):
                 model_name_or_path = str(local_path)
                 local_only = True
             else:
-                # 如果是已知的远程模型，允许下载（可配置）
                 known = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo"]
                 if model_size in known:
                     model_name_or_path = model_size
                     local_only = False
                 else:
-                    # 尝试从扫描到的本地模型中匹配（以防用户自定义名称）
                     available = self.get_available_local_models()
                     for disp, path in available:
                         if disp == model_size:
@@ -491,32 +508,33 @@ class WhisperXManager:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-    def transcribe(self, audio_path, language=None, beam_size=5, vad_filter=True,
+    def transcribe(self, audio_path, language=None, beam_size=5, vad_filter=False,
                    vad_parameters=None, word_timestamps=True, initial_prompt=None):
         if self.asr_model is None: return None, "ASR模型未加载"
-        try:
-            segments, info = self.asr_model.transcribe(
-                audio_path,
-                language=language,
-                beam_size=beam_size,
-                vad_filter=vad_filter,
-                vad_parameters=vad_parameters if vad_filter else None,
-                word_timestamps=word_timestamps,
-                initial_prompt=initial_prompt
-            )
-        except Exception as e:
-            if vad_filter and ("onnx" in str(e).lower() or "vad" in str(e).lower()):
-                print(f"VAD 失败，关闭 VAD 重试。错误: {e}")
+        with self.lock:  # 修复并发问题
+            try:
                 segments, info = self.asr_model.transcribe(
                     audio_path,
                     language=language,
                     beam_size=beam_size,
-                    vad_filter=False,
+                    vad_filter=vad_filter,
+                    vad_parameters=vad_parameters if vad_filter else None,
                     word_timestamps=word_timestamps,
                     initial_prompt=initial_prompt
                 )
-            else:
-                return None, str(e)
+            except Exception as e:
+                if vad_filter and ("onnx" in str(e).lower() or "vad" in str(e).lower()):
+                    print(f"VAD 失败，关闭 VAD 重试。错误: {e}")
+                    segments, info = self.asr_model.transcribe(
+                        audio_path,
+                        language=language,
+                        beam_size=beam_size,
+                        vad_filter=False,
+                        word_timestamps=word_timestamps,
+                        initial_prompt=initial_prompt
+                    )
+                else:
+                    return None, str(e)
         sentences = []
         all_words = []
         for seg in segments:
@@ -535,50 +553,35 @@ class WhisperXManager:
         try:
             local_align = self.get_local_align_models()
             align_model_path = None
-            lang_map = {
-                "zh": "chinese-zh-cn", "en": "english", "ja": "japanese",
-                "fr": "french", "de": "german", "es": "spanish",
-                "pt": "portuguese", "it": "italian", "nl": "dutch", "hu": "hungarian",
-                "ru": "russian", "pl": "polish", "vi": "vietnamese", "tr": "turkish",
-                "ko": "korean", "ar": "arabic", "sv": "swedish", "uk": "ukrainian",
-                "fi": "finnish", "da": "danish", "no": "norwegian", "cs": "czech",
-                "ro": "romanian", "el": "greek", "he": "hebrew", "hi": "hindi",
-                "th": "thai", "id": "indonesian", "ms": "malay", "ca": "catalan",
-                "fa": "persian", "tl": "filipino", "sk": "slovak", "bg": "bulgarian",
-                "hr": "croatian", "et": "estonian", "lv": "latvian", "lt": "lithuanian",
-                "sl": "slovenian", "sr": "serbian", "mk": "macedonian", "sq": "albanian",
-                "hy": "armenian", "ka": "georgian", "az": "azerbaijani", "eu": "basque",
-                "gl": "galician", "mt": "maltese", "cy": "welsh",
-            }
             detected = result.get("language", "en")
+            effective_lang = language or detected  # 统一语言
             if model_choice == "auto":
-                key = lang_map.get(detected.lower(), detected.lower())
+                key = effective_lang.lower()
                 for disp, path in local_align:
                     if key in disp.lower():
                         align_model_path = path
                         break
                 if not align_model_path:
-                    online_map = { ... }  # 省略，原样
-                    align_model_path = online_map.get(detected.lower())
-                    if not align_model_path:
-                        print(f"未找到语言 {detected} 的对齐模型，跳过精细对齐。")
-                        return result
+                    print(f"未找到语言 {effective_lang} 的本地对齐模型，将使用默认模型自动下载。")
+                    align_model_path = None  # 交给 load_align_model 默认处理
             else:
                 for disp, path in local_align:
                     if disp == model_choice:
                         align_model_path = path
                         break
                 if not align_model_path:
-                    align_model_path = model_choice
-            cache_key = f"{language}_{align_model_path}"
+                    align_model_path = model_choice  # 可能是远程模型名
+            cache_key = f"{effective_lang}_{align_model_path or 'default'}"
             if self.align_model is None or self.align_model_lang != cache_key:
-                print(f"加载对齐模型: {align_model_path}")
-                self.align_model, self.align_metadata = load_align_model(
-                    language_code=language or result.get("language", "en"),
+                print(f"加载对齐模型: {align_model_path or '默认'}")
+                load_kwargs = dict(
+                    language_code=effective_lang,
                     device=device,
-                    model_name=align_model_path,
                     model_dir=str(ROOT_DIR / "pretrained_models")
                 )
+                if align_model_path is not None:
+                    load_kwargs['model_name'] = align_model_path
+                self.align_model, self.align_metadata = load_align_model(**load_kwargs)
                 self.align_model_lang = cache_key
             print("执行精细对齐...")
             aligned = whisperx_align(
@@ -618,10 +621,11 @@ class WhisperXManager:
         """
         返回用于转写的音频路径（16kHz mono）
         """
+        # 统一处理输入，仅接受路径字符串
         if isinstance(audio_input, (str, Path)) and os.path.exists(str(audio_input)):
             if not force_preprocess:
                 return str(audio_input)
-            tmp = tempfile.NamedTemporaryFile(suffix="_16k_mono.wav", delete=False)
+            tmp = tempfile.NamedTemporaryFile(suffix="_16k_mono.wav", delete=False, dir=str(CACHE_DIR))
             tmp.close()
             temp_16k = tmp.name
             try:
@@ -638,33 +642,6 @@ class WhisperXManager:
                 return None
             self.temp_files.append(temp_16k)
             return temp_16k
-        # 处理 numpy 数组
-        if isinstance(audio_input, tuple) and len(audio_input)==2:
-            sr, data = audio_input
-            if data is None: return None
-            # 修复 Bug 3：转为 float32 并归一化
-            if np.issubdtype(data.dtype, np.integer):
-                data = data.astype(np.float32) / np.iinfo(data.dtype).max
-            elif data.dtype != np.float32:
-                data = data.astype(np.float32)
-            if data.ndim > 1:
-                data = np.mean(data, axis=1)
-            if sr != 16000:
-                try:
-                    data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-                except Exception as e:
-                    raise RuntimeError(f"音频重采样失败: {e}")
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
-            temp_path = tmp.name
-            try:
-                sf.write(temp_path, data, 16000)
-            except Exception:
-                try: os.unlink(temp_path)
-                except: pass
-                return None
-            self.temp_files.append(temp_path)
-            return temp_path
         return None
 
 manager = WhisperXManager()
@@ -697,21 +674,22 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
                      force_preprocess,
                      progress=gr.Progress()):
     if audio is None: return "请上传音频文件", "", ""
-    original_name = None
-    if isinstance(audio, (str, Path)):
-        original_name = str(audio)
-    elif isinstance(audio, dict) and audio.get('name'):
-        original_name = audio['name']
-    # 修复：当 original_name 为空时，设为 "recording"
-    if not original_name:
-        original_name = "recording"
-    manager.set_original_input_name(original_name)
+    # 提取原始文件名和实际文件路径
+    if isinstance(audio, dict):
+        audio_file = audio.get('name') or audio.get('path', audio)
+        original_name = audio.get('orig_name') or audio.get('name') or "recording"
+    else:
+        audio_file = audio
+        original_name = os.path.basename(str(audio)) if audio else "recording"
+    if not original_name or not audio_file:
+        return "无法获取文件", "", ""
 
+    manager.set_original_input_name(original_name)
     progress(0, desc="初始化...")
     try: ensure_model_loaded(model_size, device, compute_type, language)
     except RuntimeError as e: return str(e), "", ""
     progress(0.2, desc="预处理音频...")
-    audio_path = manager._prepare_audio(audio, force_preprocess=force_preprocess)
+    audio_path = manager._prepare_audio(audio_file, force_preprocess=force_preprocess)
     if not audio_path: return "音频处理失败", "", ""
     try:
         prompt = hotwords.strip() if hotwords else None
@@ -737,7 +715,7 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
                                         enable_punc_split, punc_chars)
         full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
         saved = save_outputs(original_name, full_text, tsjson, srt_text,
-                             language=result.get("language","未知"), model_info=model_size)
+                             language=result.get("language","未知"))
         save_info = "文件已保存:\n"
         if saved.get('txt'): save_info += f" {Path(saved['txt']).name}\n"
         if saved.get('json'): save_info += f" {Path(saved['json']).name}\n"
@@ -761,19 +739,22 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
     try:
         if video is None:
             return "请上传视频文件", "", ""
-        # 兼容多种 Gradio 返回类型
-        video_path = None
+        # 提取视频路径和原始名称
         if isinstance(video, dict):
             video_path = video.get('name') or video.get('path')
+            original_name = video.get('orig_name') or video.get('name') or "video"
         elif isinstance(video, (str, Path)):
             video_path = str(video)
+            original_name = os.path.basename(video_path)
+        else:
+            return "无法获取视频路径", "", ""
         if not video_path or not os.path.exists(str(video_path)):
             return "无法获取视频路径", "", ""
 
         progress(0, desc="初始化...")
         ensure_model_loaded(model_size, device, compute_type, language)
         progress(0.2, desc="提取音频...")
-        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=str(CACHE_DIR))
         temp_audio.close()
         audio_path = temp_audio.name
         temp_audio_path = audio_path
@@ -803,15 +784,14 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
                                         enable_silence_split, max_silence_ms,
                                         enable_punc_split, punc_chars)
         full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
-        saved = save_outputs(video_path, full_text, tsjson, srt_text,
-                             language=result.get("language","未知"), model_info=model_size)
+        saved = save_outputs(original_name, full_text, tsjson, srt_text,
+                             language=result.get("language","未知"))
         srt_path = saved.get('srt')
         if not srt_path:
             return "处理完成，未生成字幕。", safe_text(tsjson), safe_text(srt_text)
         progress(0.8, desc="嵌入字幕...")
         ts = time.strftime("%Y%m%d_%H%M%S")
-        video_stem = Path(video_path).stem
-        safe_stem = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', video_stem)
+        safe_stem = re.sub(r'[^\w\u4e00-\u9fff\-\.]', '', Path(original_name).stem)
         prefix = f"{safe_stem}_{ts}"
         out_path = OUTPUT_DIR / f"{prefix}.mp4"
 
@@ -826,9 +806,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
                    "-y", str(out_path)]
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         else:
-            safe_srt_temp = os.path.join(tempfile.gettempdir(), f"sub_{uuid.uuid4().hex[:8]}.srt")
+            safe_srt_temp = os.path.join(str(CACHE_DIR), f"sub_{uuid.uuid4().hex[:8]}.srt")
             shutil.copy2(str(srt_path), safe_srt_temp)
-            # 修复路径转义（Bug 6）
             escaped_srt = safe_srt_temp.replace('\\', '/')
             escaped_srt = escaped_srt.replace(':', '\\:').replace("'", "\\'")
             font_name = "Arial"
@@ -869,9 +848,16 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
     failed_text = []
     total = len(files)
     for i, fobj in enumerate(files, 1):
-        # 修复：使用 orig_name 保留原始文件名
-        orig_name = getattr(fobj, 'orig_name', None) or os.path.basename(str(fobj))
-        fp = str(fobj) if hasattr(fobj, '__fspath__') else str(fobj)
+        # 兼容字符串、dict、带 orig_name 的对象
+        if isinstance(fobj, dict):
+            fp = fobj.get('name') or fobj.get('path')
+            orig_name = fobj.get('orig_name') or fobj.get('name') or os.path.basename(str(fp))
+        elif hasattr(fobj, 'orig_name'):
+            fp = str(fobj)
+            orig_name = fobj.orig_name
+        else:
+            fp = str(fobj)
+            orig_name = os.path.basename(fp)
         progress(i/total, desc=f"处理 {i}/{total}: {orig_name}")
         ap = manager._prepare_audio(fp, force_preprocess=force_preprocess)
         if not ap:
@@ -900,9 +886,8 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
                                             enable_silence_split, max_silence_ms,
                                             enable_punc_split, punc_chars)
             full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
-            # 使用原始文件名保存
             save_outputs(orig_name, full_text, tsjson, srt_text,
-                         language=result.get("language","未知"), model_info=model_size)
+                         language=result.get("language","未知"))
             results_text.append(f"✅ {orig_name}: 已保存")
         except Exception as e:
             failed_text.append(f"❌ {orig_name}: {str(e)}")
@@ -989,7 +974,6 @@ def create_interface():
 
         gr.Markdown("---")
 
-        # 断句控制组件
         def build_split_controls():
             with gr.Accordion("✂️ 断句控制", open=False):
                 with gr.Row():
@@ -1009,7 +993,6 @@ def create_interface():
                     enable_silence, silence_slider, enable_punc, punc_text]
 
         with gr.Tabs():
-            # 音频识别
             with gr.Tab("音频识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1061,7 +1044,6 @@ def create_interface():
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 c_btn.click(lambda: [None, None, "", "", "", ""], outputs=[audio_input, audio_preview, hotwords_audio, text_out, json_out, srt_out])
 
-            # 视频字幕
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1096,7 +1078,6 @@ def create_interface():
                 ).then(refresh_status, outputs=[status_display_ctrl])
                 vc_btn.click(lambda: [None, "", "", "", ""], outputs=[video_input, hotwords_video, v_text, v_json, v_srt])
 
-            # 批量处理
             with gr.Tab("批量处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1135,18 +1116,21 @@ def create_interface():
 
         def set_max_length(val):
             global current_max_output_length
-            current_max_output_length = int(val)
+            with config_lock:
+                current_max_output_length = int(val)
             return get_system_info()
         max_text_len.change(set_max_length, inputs=[max_text_len], outputs=[status_display_ctrl])
         demo.load(refresh_status, outputs=[status_display_ctrl])
 
     return demo
 
-# 移除 atexit，改用 Gradio 关闭事件（可选）
 def cleanup():
     manager.unload_models()
     manager.cleanup_temp()
     clean_old_logs()
+
+# 提前注册退出清理
+atexit.register(cleanup)
 
 def main():
     demo = create_interface()
@@ -1166,8 +1150,6 @@ def main():
     else:
         print("所有端口均被占用，请手动指定空闲端口。")
         sys.exit(1)
-    # 注册退出清理
-    atexit.register(cleanup)
 
 if __name__ == "__main__":
     main()
