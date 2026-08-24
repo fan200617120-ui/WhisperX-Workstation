@@ -7,17 +7,6 @@ WhisperX 语音识别独立增强版（参数全开放 / 修复版）
 - 断句控制（时长/字符/标点/静音，可独立组合）
 - VAD 高级参数、界面截断保护、一键打开输出目录
 
-本版修复（适配 gradio 5.x / faster-whisper 1.1.0 / whisperx 3.3.1）:
-  1. 统一文件输入解析，兼容 Gradio 5 的 FileInfo 对象 / dict / str / tuple
-  2. ASR 模型列表过滤 wav2vec2 对齐模型目录，防止误选导致加载失败
-  3. clean_cjk_spaces 只删除 CJK 字符间空格，保留中英混排空格
-  4. 对齐模型语言匹配改为边界正则（修复 "en" 误匹配 "french" 等子串问题）
-  5. 对齐模型缓存 key 加入 device
-  6. 语言支持下拉选择 auto（自动检测）
-  7. CPU 模式校验 float16；设备列表按实际可用去重
-  8. 界面最大显示字符数持久化到 settings.json
-  9. 移除未使用的重量级导入，异常捕获收窄为 Exception
-
 Copyright 2026 光影的故事2018
 """
 import sys, os, json, logging, traceback, time, gc, threading, atexit, tempfile, re, subprocess, shutil, math, uuid
@@ -255,6 +244,8 @@ def _split_by_punc(segments, punc_set):
                     sub_end = start + end_idx * char_dur
                     if sub_end > end:
                         sub_end = end
+                    if sub_end <= sub_start:  # 修复：时间倒挂兜底，防止负时长子句
+                        sub_end = sub_start + 0.05
                     sub_words = []
                     if words:
                         for w in words:
@@ -269,6 +260,9 @@ def _split_by_punc(segments, punc_set):
                 current = ""
         if current.strip():
             sub_start = start + current_start_idx * char_dur
+            # 修复：末段子句起点越界兜底
+            if sub_start >= end:
+                sub_start = max(end - 0.05, start)
             sub_words = []
             if words:
                 for w in words:
@@ -364,7 +358,7 @@ def format_result_to_outputs(result, **kwargs):
         srt.append(seg["text"])
         srt.append("")
     srt_text = "\n".join(srt)
-    extra = f"语言: {result.get('language', '未知')} (概率: {result.get('language_probability', 0):.2f})"
+    extra = f"语言: {result.get('language', '未知')} (概率: {(result.get('language_probability') or 0):.2f})"
     full = f"{text}\n\n[元数据] {extra}"
     return full, ts_json, srt_text, cleaned_segments
 
@@ -463,6 +457,8 @@ class WhisperXManager:
         self.align_metadata = None
         self.align_model_lang = None
         self.original_input_name = None
+        self.asr_in_use = 0    # 转写占用计数：转写进行中禁止切换/卸载 ASR 模型，防止显存峰值翻倍
+        self.align_in_use = 0  # 对齐占用计数：对齐进行中禁止卸载对齐模型
 
     def get_available_local_models(self):
         """修复：过滤 wav2vec2/xlsr 对齐模型目录，避免出现在 ASR 模型列表中。"""
@@ -495,6 +491,8 @@ class WhisperXManager:
 
     def load_asr_model(self, model_size, device, compute_type):
         with self.lock:
+            if not model_size:
+                return False, "未发现模型：请先在 pretrained_models 目录放置模型文件，然后刷新页面后重试"
             # 修复：CPU 下 float16 校验
             if device == "cpu" and compute_type == "float16":
                 return False, "CPU 模式不支持 float16，请选择 int8_float32 或 float32"
@@ -519,7 +517,21 @@ class WhisperXManager:
             if (self.asr_model is not None and self.current_asr_model_name == model_name_or_path
                     and self.current_device == device and self.current_compute_type == compute_type):
                 return True, f"ASR模型已加载: {model_size}"
-            self.unload_models()
+            # 修复：转写占用期间禁止切换 ASR 模型——旧模型被 del 后仍被转写线程
+            # 的本地引用持有，显存不会释放，新模型再加载会峰值翻倍
+            if self.asr_in_use > 0:
+                return False, "有转写任务正在进行，暂不能切换 ASR 模型，请等待其完成后再试"
+            # 修复：切换 ASR 模型只卸载 ASR 部分（原 unload_models 会连带卸载
+            # 对齐模型，既无必要又会与正在进行的对齐任务竞态）
+            if self.asr_model is not None:
+                del self.asr_model
+                self.asr_model = None
+                self.current_asr_model_name = None
+                self.current_device = None
+                self.current_compute_type = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             try:
                 self.asr_model = WhisperModel(model_name_or_path, device=device,
                                               compute_type=compute_type, local_files_only=local_only)
@@ -532,7 +544,12 @@ class WhisperXManager:
                 return False, f"加载ASR模型失败: {str(e)}"
 
     def unload_models(self):
+        # 修复：转写/对齐占用期间禁止卸载——旧模型被 del 后仍被任务线程的
+        # 本地引用持有，显存不会释放，实际效果是白白丢弃模型还可能触发
+        # 新旧模型同时驻留（显存峰值翻倍）
         with self.lock:
+            if self.asr_in_use > 0 or self.align_in_use > 0:
+                return False, "模型正在使用中（转写/对齐进行中），请等待任务完成后再卸载"
             if self.asr_model:
                 del self.asr_model
             self.asr_model = None
@@ -543,9 +560,13 @@ class WhisperXManager:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.unload_align_model()
+            return True, "模型已卸载"
 
     def unload_align_model(self):
         with self.lock:
+            # 修复：对齐占用期间禁止卸载，防止旧模型引用存活导致显存翻倍
+            if self.align_in_use > 0:
+                return
             if self.align_model is not None:
                 del self.align_model
             self.align_model = None
@@ -557,11 +578,18 @@ class WhisperXManager:
 
     def transcribe(self, audio_path, language=None, beam_size=5, vad_filter=False,
                    vad_parameters=None, word_timestamps=True, initial_prompt=None):
-        if self.asr_model is None:
-            return None, "ASR模型未加载"
+        # 修复：锁内只取模型引用，推理在锁外执行，
+        # 避免转写期间阻塞"卸载模型/刷新状态"等 UI 事件
         with self.lock:
+            if self.asr_model is None:
+                return None, "ASR模型未加载"
+            model = self.asr_model
+            # 修复：转写占用计数（faster-whisper 的 segments 为惰性生成器，
+            # 计数需覆盖下方完整消费过程），防止转写期间切换/卸载 ASR 模型
+            self.asr_in_use += 1
+        try:
             try:
-                segments, info = self.asr_model.transcribe(
+                segments, info = model.transcribe(
                     audio_path, language=language, beam_size=beam_size,
                     vad_filter=vad_filter,
                     vad_parameters=vad_parameters if vad_filter else None,
@@ -569,7 +597,7 @@ class WhisperXManager:
             except Exception as e:
                 if vad_filter and ("onnx" in str(e).lower() or "vad" in str(e).lower()):
                     print(f"VAD 失败，关闭 VAD 重试。错误: {e}")
-                    segments, info = self.asr_model.transcribe(
+                    segments, info = model.transcribe(
                         audio_path, language=language, beam_size=beam_size,
                         vad_filter=False, word_timestamps=word_timestamps,
                         initial_prompt=initial_prompt)
@@ -587,6 +615,9 @@ class WhisperXManager:
             result = {"language": info.language, "language_probability": info.language_probability,
                       "segments": sentences, "words": all_words}
             return result, None
+        finally:
+            with self.lock:
+                self.asr_in_use = max(0, self.asr_in_use - 1)
 
     def apply_whisperx_align(self, result, audio_path, language, device, model_choice):
         if not WHISPERX_ALIGN_AVAILABLE:
@@ -610,29 +641,39 @@ class WhisperXManager:
                     align_model_path = model_choice
             # 修复：缓存 key 加入 device
             cache_key = f"{effective_lang}_{device}_{align_model_path or 'default'}"
-            if self.align_model is None or self.align_model_lang != cache_key:
-                if self.align_model is not None:
-                    self.unload_align_model()
-                print(f"加载对齐模型: {align_model_path or '默认'}")
-                load_kwargs = dict(language_code=effective_lang, device=device,
-                                   model_dir=str(ROOT_DIR / "pretrained_models"))
-                if align_model_path is not None:
-                    load_kwargs['model_name'] = align_model_path
-                self.align_model, self.align_metadata = load_align_model(**load_kwargs)
-                self.align_model_lang = cache_key
-            print("执行精细对齐...")
-            aligned = whisperx_align(result["segments"], self.align_model, self.align_metadata,
-                                     audio_path, device, return_char_alignments=False)
-            if "segments" in aligned:
-                result["segments"] = aligned["segments"]
-                new_words = []
-                for seg in result["segments"]:
-                    if "words" in seg:
-                        new_words.extend(seg["words"])
-                result["words"] = new_words
-            print("精细对齐完成。")
+            # 修复：模型加载/取用加锁，避免与 unload_align_model 竞态
+            with self.lock:
+                if self.align_model is None or self.align_model_lang != cache_key:
+                    if self.align_model is not None:
+                        self.unload_align_model()
+                    logger.info(f"加载对齐模型: {align_model_path or '默认'}")
+                    load_kwargs = dict(language_code=effective_lang, device=device,
+                                       model_dir=str(ROOT_DIR / "pretrained_models"))
+                    if align_model_path is not None:
+                        load_kwargs['model_name'] = align_model_path
+                    self.align_model, self.align_metadata = load_align_model(**load_kwargs)
+                    self.align_model_lang = cache_key
+                align_model = self.align_model
+                align_metadata = self.align_metadata
+                # 修复：对齐占用计数，覆盖锁外 whisperx_align 执行段
+                self.align_in_use += 1
+            try:
+                print("执行精细对齐...")
+                aligned = whisperx_align(result["segments"], align_model, align_metadata,
+                                         audio_path, device, return_char_alignments=False)
+                if "segments" in aligned:
+                    result["segments"] = aligned["segments"]
+                    new_words = []
+                    for seg in result["segments"]:
+                        if "words" in seg:
+                            new_words.extend(seg["words"])
+                    result["words"] = new_words
+                print("精细对齐完成。")
+            finally:
+                with self.lock:
+                    self.align_in_use = max(0, self.align_in_use - 1)
         except Exception as e:
-            print(f"精细对齐出错: {e}，将使用原始时间戳。")
+            logger.warning(f"精细对齐出错: {e}，将使用原始时间戳。")
         return result
 
     def cleanup_temp(self):
@@ -661,7 +702,7 @@ class WhisperXManager:
             try:
                 cmd = [FFMPEG_PATH, "-y", "-i", audio_input, "-ar", "16000",
                        "-ac", "1", "-c:a", "pcm_s16le", temp_16k]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
             except Exception as e:
                 try:
                     os.unlink(temp_16k)
@@ -784,7 +825,7 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         temp_audio_path = audio_path
         cmd = [FFMPEG_PATH, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
                "-ar", "16000", "-ac", "1", "-y", audio_path]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
         progress(0.4, desc="转写中...")
         lang = _norm_lang(language)
         prompt = hotwords.strip() if hotwords else None
@@ -824,7 +865,7 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             cmd = [FFMPEG_PATH, "-i", video_path, "-i", str(srt_path), "-c", "copy",
                    "-c:s", "mov_text", "-metadata:s:s:0", f"language={sub_lang_code}",
                    "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
         else:
             safe_srt_temp = os.path.join(str(CACHE_DIR), f"sub_{uuid.uuid4().hex[:8]}.srt")
             shutil.copy2(str(srt_path), safe_srt_temp)
@@ -837,7 +878,7 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             vf_str = (f"subtitles='{escaped_srt}':force_style='FontName={font_name},"
                       f"FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H000000,BorderStyle=3'")
             cmd = [FFMPEG_PATH, "-i", video_path, "-vf", vf_str, "-c:a", "copy", "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=3600)
         result_msg = (f"✅ 处理完成！输出视频: {out_path.name}\n"
                       f"字幕文件已保存至 output 目录。\n\n【识别文本】\n{full_text}")
         progress(1.0, desc="完成")
@@ -929,8 +970,8 @@ def load_model_click(model_size, device, compute_type):
     return msg + "\n" + get_system_info()
 
 def unload_model_click():
-    manager.unload_models()
-    return "模型已卸载\n" + get_system_info()
+    _, msg = manager.unload_models()
+    return msg + "\n" + get_system_info()
 
 def refresh_status():
     return get_system_info()
