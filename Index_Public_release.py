@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S WebUI Professional Edition
 Copyright 2026 光影的故事2018
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,17 +33,63 @@ if not PYTHON_EXE.exists():
 SCRIPTS_DIR = BASE_DIR / "core"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)  # 确保输出目录存在
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+def read_log_tail(path, max_lines=8):
+    """读取日志文件末尾若干行（跳过纯空行）。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return "(日志读取失败)"
+    lines = [x for x in text.splitlines() if x.strip()]
+    return "\n".join(lines[-max_lines:]) or "(日志为空)"
 
 def launch_script(script_name):
-    """启动指定脚本"""
+    """启动指定脚本。
+
+    修复三点：
+    1. 原实现只调 Popen 就无条件返回「✅ 已启动」，但 Popen 只保证进程创建成功 ——
+       脚本可能因为依赖缺失、语法错误在 1 秒内就崩了，界面却仍显示成功。
+       现在启动后短暂等待，检查进程是否已经退出，并把真实原因报出来。
+    2. 原提示说「请查看新窗口」，但子进程是**继承当前控制台**的
+       （Popen 没带 CREATE_NEW_CONSOLE），根本不会开新窗口，提示与实际不符。
+       现在把每个脚本的输出重定向到 logs/<脚本名>.log，用户有据可查。
+    3. 无论成功失败都给出日志路径 —— 脚本绑定端口需要十几秒（要加载 torch 等），
+       主界面无法一直等着判断，所以把日志交给用户，便于自行排查。
+    """
     script_path = SCRIPTS_DIR / script_name
     if not script_path.exists():
         return f"❌ 脚本 {script_name} 不存在"
+    log_path = LOG_DIR / f"{script_path.stem}.log"
+    # 子进程环境：
+    # - PYTHONUNBUFFERED：Python 把 stdout 重定向到文件时用的是块缓冲，
+    #   要攒满约 8KB 才落盘 —— 实测启动 12 秒后日志仍是 0 字节，没法用来排查。
+    # - PYTHONIOENCODING：Windows 下子进程 stdout 默认按 cp936 编码，
+    #   而日志按 utf-8 读取，不设会全是乱码。
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
-        subprocess.Popen([str(PYTHON_EXE), str(script_path)], cwd=str(SCRIPTS_DIR))
-        return f"✅ 已启动 {script_name}，请查看新窗口"
+        with open(log_path, "w", encoding="utf-8", errors="replace") as lf:
+            proc = subprocess.Popen(
+                [str(PYTHON_EXE), str(script_path)], cwd=str(SCRIPTS_DIR),
+                stdout=lf, stderr=subprocess.STDOUT, env=env)
     except Exception as e:
         return f"❌ 启动失败：{e}"
+
+    # 短暂等待，捕捉「秒退」类错误（依赖缺失 / 语法错误 / 脚本不存在等）
+    time.sleep(2.0)
+    code = proc.poll()
+    if code is None:
+        return (f"✅ 已启动 {script_name}（PID {proc.pid}）\n"
+                f"界面会在十几秒后自动在浏览器打开。\n"
+                f"日志: logs/{log_path.name}")
+    detail = read_log_tail(log_path)
+    return (f"❌ {script_name} 启动后立即退出（退出码 {code}）\n"
+            f"常见原因：依赖缺失、模型目录不完整、端口被占用\n"
+            f"日志末尾：\n{detail}\n"
+            f"完整日志: logs/{log_path.name}")
 
 def open_folder(path):
     """使用系统文件管理器打开文件夹"""

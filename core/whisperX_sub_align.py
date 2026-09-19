@@ -285,10 +285,18 @@ def force_align_units(units: List[Dict], transcribed_words: List[Dict],
         b = ui
         prev_t = aligned[a - 1]["end"] if a > 0 and aligned[a - 1] is not None else default_start
         next_t = aligned[b]["start"] if b < n and aligned[b] is not None else default_end
-        if next_t <= prev_t:
-            next_t = prev_t + 0.05 * (b - a)
-        span = max(next_t - prev_t, 0.05 * (b - a))
-        per = max(span / (b - a), 0.02)
+        # 修复：原实现 span 带 0.05*(b-a) 的下限，当 ASR 漏掉一整段时
+        # （next_t - prev_t 很小、未匹配单元却很多），插值总时长会被撑到远超可用区间，
+        # 末尾直接压过下一个「已匹配」单元的 start → SRT 时间轴倒挂。
+        # 实测：18 个未匹配字铺到 0.05~0.95s，而下一个匹配单元却在 0.150s。
+        # 现改为严格把这一批插值限制在 [prev_t, next_t] 之内。
+        available = next_t - prev_t
+        if available > 0:
+            per = available / (b - a)
+        else:
+            # 时间戳本身自相矛盾（下一个已匹配单元早于上一段结束），
+            # 任何分配都会重叠，只能给一个最小可视时长。
+            per = 0.01
         for k in range(a, b):
             st = prev_t + (k - a) * per
             u = units[k]
@@ -385,8 +393,14 @@ def generate_merged_srt(
             should_split = True
         # 2) 标点断句（修复：基于原文区间检测，真实生效）
         if not should_split and merge_by_punc and punc_set and i + 1 < n:
+            # 修复：单词级粒度下单元由 re.finditer(r'\S+') 切出，
+            # "Hello," 的标点被包在单元内部，两个单元「之间」只剩空格，
+            # 原来只查 between 永远检测不到标点 —— 勾选「按标点断句」等于没生效
+            # （实测：字符级能断出 3 条，单词级只出 1 条）。
+            # 现同时检查当前单元尾部与两单元之间的空隙。
+            tail = full_original[aligned[i]["orig_idx"]:aligned[i]["orig_end"]]
             between = full_original[aligned[i]["orig_end"]:aligned[i + 1]["orig_idx"]]
-            if any(ch in punc_set for ch in between):
+            if any(ch in punc_set for ch in tail) or any(ch in punc_set for ch in between):
                 should_split = True
         # 3) 静音断句
         if not should_split and merge_by_silence and i + 1 < n:
@@ -437,30 +451,56 @@ def generate_merged_srt(
 
 # ---------- 锚点（保留原逻辑） ----------
 def _time_density_split_points(items, start_idx, end_idx, min_gap=0.18):
-    split_indices = []
-    for i in range(start_idx, end_idx - 1):
-        gap = items[i + 1]["start"] - items[i]["end"]
-        if gap > min_gap:
-            split_indices.append(i + 1)
-    return split_indices
+    """返回静音间隙的位置列表：间隙位于 items[sp-1] 与 items[sp] 之间。
+
+    修复：原循环 `range(start_idx, end_idx - 1)` 配合 `append(i + 1)`，
+    返回值范围被限死在 s_idx+1 ~ e_idx-1 —— 也就是说**只能看到句子内部的间隙**，
+    而句子边界本身（s_idx、e_idx 这两个位置）恰恰是唯一有用的。
+    现在改为扫描 [start_idx, end_idx]（含两端），并夹在合法下标内。
+    """
+    n = len(items)
+    lo = max(1, start_idx)        # 间隙需要 items[sp-1] 存在，故 sp >= 1
+    hi = min(n - 1, end_idx)      # 间隙需要 items[sp] 存在，故 sp <= n-1
+    out = []
+    for sp in range(lo, hi + 1):
+        if items[sp]["start"] - items[sp - 1]["end"] > min_gap:
+            out.append(sp)
+    return out
 
 def _refine_by_density(sentence, items, s_idx, e_idx, boundary_window=3, min_gap=0.18):
-    if e_idx - s_idx <= 1:
-        return sentence
-    splits = _time_density_split_points(items, s_idx, e_idx, min_gap=min_gap)
-    if not splits:
+    """把句子边界吸附到最近的静音间隙上。
+
+    修复：原实现只扫句子内部的间隙，于是句首会被吸附到「句内第一个间隙之后那个词」。
+    实测（真实音频 + faster-whisper-tiny）：一句话里第 2 个词后有 0.36s 停顿时，
+    句首从 0.00 被推后到 1.30s，**「您好」两个词的显示时间被整段吃掉** ——
+    字幕在该词已经说完之后才出现。句尾同理会吃掉最后一个词。
+    而 enable_density_anchor 默认就是 True，所以每次打轴都会踩。
+
+    现在改成：句首只在「不越过句子首词」的间隙上吸附（sp <= s_idx），
+    句尾只在「不早于句子末词」的间隙上吸附（sp >= e_idx），绝不因为吸附而丢词。
+    """
+    n = len(items)
+    if n == 0 or e_idx - s_idx <= 1:
         return sentence
     start = sentence["start"]
     end = sentence["end"]
-    for sp in splits:
-        if abs(sp - s_idx) <= boundary_window:
-            start = items[sp]["start"]
+
+    # 句首：候选间隙需满足 sp <= s_idx（即位于首词之前或就是首词前那个间隙）
+    lo = max(1, s_idx - boundary_window)
+    best = None
+    for sp in range(lo, s_idx + 1):
+        if items[sp]["start"] - items[sp - 1]["end"] > min_gap:
+            best = sp          # 循环递增，最后一个命中的离句首最近
+    if best is not None:
+        start = items[best]["start"]
+
+    # 句尾：候选间隙需满足 sp >= e_idx（即位于末词之后），取最近的一个
+    hi = min(n - 1, e_idx + boundary_window)
+    for sp in range(e_idx, hi + 1):
+        if items[sp]["start"] - items[sp - 1]["end"] > min_gap:
+            end = items[sp]["start"]
             break
-    for sp in splits:
-        if abs(sp - e_idx) <= boundary_window:
-            # 句尾应落在间隙起点（即上一词条结束之后），而非间隙后词条的结束
-            end = items[sp]["start"] if sp < len(items) else items[-1]["end"]
-            break
+
     if end <= start:
         end = start + 0.1
     return {"start": start, "end": end, "text": sentence["text"]}
@@ -543,6 +583,12 @@ def find_ffmpeg():
     portable_dir = PROJECT_ROOT / "ffmpeg" / "bin"
     exe = portable_dir / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
     if exe.exists():
+        # 修复：原实现只返回路径、没有把 ffmpeg 目录加进 PATH。
+        # whisperx 库内部的 load_audio 是写死调用 "ffmpeg"（靠 PATH 查找）的，
+        # 只用内置 ffmpeg 的用户做精细对齐时会抛 FileNotFoundError，
+        # 又被 except 吞掉 → 静默退化成粗略时间戳。
+        # 其余三个脚本（whisperX.py / _pro.py / _basic.py）都做了这一步，只有本文件漏了。
+        os.environ["PATH"] = str(portable_dir) + os.pathsep + os.environ.get("PATH", "")
         return str(exe)
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
@@ -568,7 +614,10 @@ def get_audio_duration_robust(audio_path: str) -> Optional[float]:
     try:
         cmd = [get_ffprobe_path(), "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        # 修复：text=True 未指定 encoding，Windows 下按 GBK 解码 ffprobe 输出，
+        # 路径含中文时会抛 UnicodeDecodeError（被外层 except 吞掉 → 时长变成 None）
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=10)
         if result.returncode == 0:
             return float(result.stdout.strip())
     except Exception:
@@ -629,6 +678,35 @@ LANGUAGE_ALIGN_MODEL_MAP = {
     "id": "jonatasgrosman/wav2vec2-large-xlsr-53-indonesian",
 }
 
+# ============ 精度支持查询 ============
+# 精度候选（顺序即下拉框显示顺序，与原默认保持一致：int8_float32 优先）
+_COMPUTE_PREFERENCE = ["int8_float32", "float16", "float32", "int8_float16",
+                       "int8", "int16", "bfloat16"]
+
+
+def supported_compute_types(device):
+    """查询 CTranslate2 在该设备上**真正支持**的精度。
+
+    修复：界面原本无条件提供 ["int8_float32", "float16", "float32"]，
+    但 float16 能不能用取决于显卡。实测 GTX 1080（算力 6.1）在
+    ctranslate2 4.4.0 下 CUDA 只支持 {int8, int8_float32, float32}，
+    **不支持 float16** —— 用户在下拉框选了 float16 必然报
+    "Requested float16 compute type, but the target device or backend
+     do not support efficient float16 computation."。
+    现改为按实际支持的精度构造下拉框，并在加载时做运行时校验。
+    """
+    try:
+        import ctranslate2
+        supported = set(ctranslate2.get_supported_compute_types(device))
+    except Exception as e:
+        print(f"[WARN] 无法查询 {device} 支持的精度（{e}），回退默认列表")
+        supported = {"int8_float32", "float32"}
+        if device != "cpu":
+            supported.add("float16")
+    choices = [c for c in _COMPUTE_PREFERENCE if c in supported]
+    return choices or ["int8_float32", "float32"]
+
+
 # ============ 模型管理器 ============
 class AlignModelManager:
     def __init__(self):
@@ -675,8 +753,13 @@ class AlignModelManager:
 
     def load_model(self, model_size, device, compute_type):
         with self.lock:
-            if device == "cpu" and compute_type == "float16":
-                return False, "CPU 模式不支持 float16，请选择 int8_float32 或 float32"
+            # 修复：原校验只拦 CPU+float16。实测 GTX 1080 上 CUDA 也不支持 float16
+            # （ctranslate2 4.4.0 在算力 6.1 上只给 {int8, int8_float32, float32}），
+            # 现改为按「该设备实际支持的精度」做通用校验。
+            _ok_types = supported_compute_types(device)
+            if compute_type not in _ok_types:
+                return False, (f"{device} 不支持 {compute_type}，"
+                               f"请选择: {'、'.join(_ok_types)}")
             if (self.model is not None and self.current_model_name == model_size
                     and self.device == device and self.compute_type == compute_type):
                 return True, f"模型 {model_size} 已加载"
@@ -890,7 +973,8 @@ def run_alignment(
             cmd = [FFMPEG_PATH, "-y", "-i", audio_path, "-ar", "16000",
                    "-ac", "1", "-c:a", "pcm_s16le", temp_preprocessed]
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+                subprocess.run(cmd, check=True, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', timeout=600)
                 temp_files.append(temp_preprocessed)
                 audio_path = temp_preprocessed
                 logger.info("音频已预处理为 16kHz 单声道")
@@ -904,6 +988,7 @@ def run_alignment(
         # ---- 对齐模型选择 ----
         local_align_models = manager.get_local_align_models()
         use_whisperx_align = False
+        align_fallback_reason = ""   # 精细对齐失败原因（用于在状态里如实告知用户）
         align_model_name_for_load = None
         align_model_dir_for_load = str(ALIGN_CACHE_DIR)
         align_model_display = ""
@@ -1005,8 +1090,11 @@ def run_alignment(
                 # 修复：移除此处主动卸载调用——任务活跃期间 active_tasks>=1，
                 # unload_align_model 必然短路，从未生效；统一由 finally 收尾
             except Exception as e:
+                # 修复：原来只写日志、界面仍宣称「对齐模型: xxx」，用户以为已经精细对齐，
+                # 实际用的是 faster-whisper 的原始时间戳。现记录失败原因并在状态里如实说明。
                 logger.warning(f"whisperx.align 失败，回退简单算法: {e}")
                 use_whisperx_align = False
+                align_fallback_reason = str(e)
                 result = original_result
 
         words = extract_words_from_result(result, align_granularity, use_whisperx_align)
@@ -1023,6 +1111,9 @@ def run_alignment(
         aligned = force_align_units(units, words, align_granularity, duration)
         if not aligned:
             return "错误: 对齐失败，请检查主文稿与音频是否匹配", "", "", "", "", "", "", system_info
+        # 安全网：兜底保证时间轴单调不倒退（插值、锚点微调都可能引入重叠），
+        # 否则 SRT 会出现时间倒挂，播放器里字幕乱跳。
+        aligned = _ensure_monotonic(aligned)
         word_srt = words_to_srt(aligned)
 
         initial_sentences, unit_para = build_paragraph_sentences(aligned, para_spans, paragraphs)
@@ -1108,6 +1199,10 @@ def run_alignment(
             f.write(merged_srt)
         status = (f"对齐完成！\n逐词字幕: {word_path.name}\n整句字幕: {sent_path.name}\n"
                   f"合并字幕: {merged_path.name}\n对齐模型: {align_model_display}")
+        if align_fallback_reason:
+            # 如实告知：精细对齐没成功，用的是 ASR 原始时间戳
+            status += (f"\n\n⚠️ 精细对齐未生效，已回退为 ASR 原始时间戳。\n"
+                       f"原因: {align_fallback_reason[:200]}")
         if anchor_used and anchor_srt:
             anchor_path = output_dir / f"{prefix}_anchor.srt"
             with open(anchor_path, "w", encoding="utf-8") as f:
@@ -1174,11 +1269,11 @@ def set_max_length(val):
 def read_text_robust(path) -> str:
     """修复：文稿读取支持 UTF-8(BOM)/GB18030 编码回退（原硬编码 utf-8，
     GBK 编码文稿会直接 UnicodeDecodeError）；全部失败则以替换符兜底。"""
-    for enc in ("utf-8-sig", "gb18030"):
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "gb18030"):
         try:
             with open(path, "r", encoding=enc) as f:
                 return f.read()
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, LookupError):
             continue
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
@@ -1285,9 +1380,16 @@ def create_ui():
                                     label="设备",
                                     choices=["cuda", "cpu"] if torch.cuda.is_available() else ["cpu"],
                                     value="cuda" if torch.cuda.is_available() else "cpu")
+                                # 修复：原写法硬编码 ["int8_float32","float16","float32"]，
+                                # 无条件提供 float16。实测 GTX 1080（算力 6.1）在
+                                # ctranslate2 4.4.0 下 CUDA 不支持 float16，选了必然加载失败。
+                                # 现按该设备实际支持的精度构造。
+                                _dev0 = "cuda" if torch.cuda.is_available() else "cpu"
+                                _ctypes = supported_compute_types(_dev0)
+                                print(f"[OK] {_dev0} 支持的精度: {_ctypes}")
                                 compute_drop = gr.Dropdown(label="计算类型",
-                                                           choices=["int8_float32", "float16", "float32"],
-                                                           value="int8_float32")
+                                                           choices=_ctypes,
+                                                           value=_ctypes[0])
                             with gr.Row():
                                 primary_lang = gr.Dropdown(label="主语言", choices=all_languages, value="zh")
                                 beam_slider = gr.Slider(label="Beam Size", minimum=1, maximum=10, value=5, step=1)

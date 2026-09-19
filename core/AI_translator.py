@@ -117,10 +117,10 @@ PROMPTS = {
 
 要求：
 1. 严格保留原文的时间轴格式 (例如: 00:00:01,000 --> 00:00:03,000)。
-2.对于专有名词或专业术语，请保持一致性
+2. 对于专有名词或专业术语，请保持一致性。
 3. 重点修正同音字错误。
-5. 保持原意，不要大幅改写。
-6. 输出修正后的文本即可。
+4. 保持原意，不要大幅改写。
+5. 输出修正后的文本即可。
 
 原文内容：
 """
@@ -128,7 +128,14 @@ PROMPTS = {
 
 def open_url(url):
     """调用浏览器打开指定链接"""
-    webbrowser.open(url)
+    # 修复：原来不检查 webbrowser.open 的返回值（打开失败返回 False），
+    # 系统没有关联默认浏览器时也会提示「已打开」，用户找不到网站。
+    try:
+        opened = webbrowser.open(url)
+    except Exception as e:
+        return f"❌ 打开浏览器失败：{e}"
+    if not opened:
+        return f"❌ 未能打开浏览器，请手动访问：{url}"
     return f"✅ 已打开 {url}，请查看浏览器"
 
 def update_prompt(prompt_name):
@@ -264,10 +271,26 @@ with gr.Blocks(title="🤖 在线AI助手 Pro", theme=gr.themes.Default()) as de
     btn_chatglm_tab2.click(fn=lambda: open_url(URLS["ChatGLM"]), outputs=status2)
     btn_yuanbao_tab2.click(fn=lambda: open_url(URLS["腾讯元宝"]), outputs=status2)
 
+# 端口候选。
+# 修复：原先硬编码 18001 且**没有回退**，而 18001 正好落在 whisperX_sub_align.py 的
+# 18001-18005 段内。用户先点「字幕自动打轴」再点「在线AI助手」时，本脚本会直接抛
+#   OSError: Cannot find empty port in range: 18001-18001
+# 崩掉，界面上表现为「点了没反应」。
+# 实测确认 Gradio 端口冲突时抛的是 OSError，所以下面的 except OSError 能正确接住。
+LAUNCH_PORTS = [18011, 18012, 18013, 18014, 18015]
+
+
+def launch_server():
+    """依次尝试候选端口启动，全部被占用时明确报错而不是静默崩掉。"""
+    for port in LAUNCH_PORTS:
+        try:
+            demo.launch(server_name="127.0.0.1", server_port=port,
+                        inbrowser=True, show_error=True)
+            return
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+    print(f"[错误] 候选端口全部被占用，无法启动: {LAUNCH_PORTS}")
+
+
 if __name__ == "__main__":
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=18001,
-        inbrowser=True,
-        show_error=True
-    )
+    launch_server()

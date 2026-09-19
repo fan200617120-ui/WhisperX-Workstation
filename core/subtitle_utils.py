@@ -56,18 +56,63 @@ ROOT_DIR = SCRIPT_DIR.parent
 OUTPUT_DIR = ROOT_DIR / "output" / "字幕处理"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# ==================== 编码兼容读取 ====================
+# 修复：原先 11 处读取全部硬编码 read_text(encoding='utf-8')，遇到 GBK / GB2312 /
+# UTF-16 编码的字幕（中文用户很常见）会直接抛异常，界面只显示「读取文件失败」，
+# 整个功能不可用。现统一走多编码尝试。
+_TEXT_ENCODINGS = ('utf-8-sig', 'utf-8', 'utf-16', 'gb18030')
+
+
+def read_text_smart(path, encodings=_TEXT_ENCODINGS):
+    """按常见编码依次尝试读取文本文件，返回解码后的字符串。
+
+    顺序说明：utf-8-sig 兼容带/不带 BOM 的 UTF-8；utf-16 需 BOM 才命中，
+    放在 gb18030 之前可避免 UTF-16 内容被 gb18030 误吞；
+    gb18030 是 GBK/GB2312 的超集，放最后兜底。
+    """
+    raw = Path(path).read_bytes()
+    for enc in encodings:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, UnicodeError, LookupError):
+            continue
+    raise ValueError(f"无法识别文件编码，已尝试: {encodings}")
+
+
+def gen_timestamp():
+    """带毫秒的时间戳。修复：原 %H%M%S 只精确到秒，
+    同一秒内连续点击会覆盖上一次的输出文件。"""
+    return time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+
+
 # ==================== 通用函数 ====================
 def parse_srt(content):
-    """解析SRT内容，返回条目列表"""
+    """解析SRT内容，返回条目列表。
+
+    修复：原条件 `len(lines) >= 3` 会把「文本为空」的字幕块（只有序号 + 时间轴两行）
+    整条丢掉，而且没有任何提示；连带 merge_bilingual 的条数校验会误报
+    「中文和英文字幕条数不一致」，用户去数条数发现两边一样，无从排查。
+    现改为按「第 2 行是时间轴」判断，并额外兼容省略序号的块。
+    """
     entries = []
     blocks = re.split(r'\n\n+', content.strip())
     for block in blocks:
         lines = block.strip().split('\n')
-        if len(lines) >= 3:
+        if not lines or not lines[0]:
+            continue
+        if len(lines) >= 2 and '-->' in lines[1]:
+            # 标准 SRT：序号 + 时间轴 + 文本（文本可为空）
             entries.append({
                 'index': lines[0].strip(),
                 'timecode': lines[1].strip(),
-                'text': '\n'.join(lines[2:]).strip()
+                'text': '\n'.join(lines[2:]).strip() if len(lines) > 2 else ''
+            })
+        elif '-->' in lines[0]:
+            # 省略序号的 SRT / VTT 风格：时间轴 + 文本
+            entries.append({
+                'index': str(len(entries) + 1),
+                'timecode': lines[0].strip(),
+                'text': '\n'.join(lines[1:]).strip() if len(lines) > 1 else ''
             })
     return entries
 
@@ -76,29 +121,43 @@ def build_srt(entries):
     return '\n\n'.join([f"{e['index']}\n{e['timecode']}\n{e['text']}" for e in entries])
 
 def parse_lrc(content):
-    """解析LRC格式，返回 (时间戳秒, 文本) 列表，时间戳为秒"""
-    pattern = re.compile(r'\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)')
+    """解析LRC格式，返回 (时间戳秒, 文本) 列表，时间戳为秒。
+
+    修复：原正则 `\\[(\\d{2}):(\\d{2})\\.(\\d{2,3})\\](.*)` 要求分钟恰好两位、
+    且必须带小数部分，导致 "[1:23.45]"、"[00:01]"、"[00:01:23]" 等常见变体
+    被静默丢弃（不匹配就 continue，没有任何提示）。
+    现放宽为：1-3 位分钟，小数部分可选，兼容 [MM:SS.cc] / [MM:SS] / [MM:SS:CC]。
+    """
+    pattern = re.compile(r'\[(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?(?:\.(\d{1,3}))?\](.*)')
     entries = []
     for line in content.split('\n'):
         line = line.strip()
         if not line:
             continue
         m = pattern.match(line)
-        if m:
-            minutes = int(m.group(1))
-            seconds = int(m.group(2))
-            millis = int(m.group(3).ljust(3, '0')[:3])  # 补全3位毫秒
-            total_seconds = minutes * 60 + seconds + millis / 1000.0
-            text = m.group(4).strip()
-            entries.append((total_seconds, text))
+        if not m:
+            continue
+        minutes = int(m.group(1))
+        seconds = int(m.group(2))
+        if m.group(3) is not None:
+            # [分:秒:百分秒] 写法
+            minutes = minutes * 60 + seconds
+            seconds = int(m.group(3))
+        millis = int((m.group(4) or '0').ljust(3, '0')[:3])  # 补全3位毫秒
+        total_seconds = minutes * 60 + seconds + millis / 1000.0
+        entries.append((total_seconds, (m.group(5) or '').strip()))
     return entries
 
 def seconds_to_srt_time(seconds):
-    """将秒数转换为SRT时间格式 (HH:MM:SS,mmm)"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
+    """将秒数转换为SRT时间格式 (HH:MM:SS,mmm)
+
+    修复：原写法 `int((seconds - int(seconds)) * 1000)` 受浮点误差影响会少 1 毫秒
+    （1.9 → 899ms、2.3 → 299ms、10.29 → 289ms）。改为先整体转成毫秒再拆分。
+    """
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours, rem = divmod(total_ms, 3600000)
+    minutes, rem = divmod(rem, 60000)
+    secs, millis = divmod(rem, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def srt_time_to_ass(time_str):
@@ -110,7 +169,8 @@ def srt_time_to_ass(time_str):
         minutes = int(parts[1])
         sec_frac = parts[2].split('.')
         seconds = int(sec_frac[0])
-        centiseconds = int(float('0.' + sec_frac[1]) * 100) if len(sec_frac) > 1 else 0
+        # 修复：int() 截断会少 1 厘秒（899ms → .89 而非 .90）；并夹在 0-99 防止进位成三位
+        centiseconds = min(99, int(round(float('0.' + sec_frac[1]) * 100))) if len(sec_frac) > 1 else 0
         return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
     return time_str
 
@@ -164,7 +224,7 @@ def ass_time_to_seconds(time_str):
             seconds = int(sec_frac[0])
             centiseconds = int(sec_frac[1]) if len(sec_frac) > 1 else 0
             return hours * 3600 + minutes * 60 + seconds + centiseconds / 100.0
-    except:
+    except Exception:
         return None
     return None
 
@@ -197,11 +257,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return '\n'.join(lines)
 
 def seconds_to_ass_time(seconds):
-    """将秒数转换为ASS时间格式 (H:MM:SS.cc)"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    centiseconds = int((seconds - int(seconds)) * 100)
+    """将秒数转换为ASS时间格式 (H:MM:SS.cc)
+
+    修复：同 seconds_to_srt_time，原 int((seconds - int(seconds)) * 100)
+    受浮点误差影响会少 1 厘秒。改为先整体转厘秒再拆分。
+    """
+    total_cs = max(0, int(round(seconds * 100)))
+    hours, rem = divmod(total_cs, 360000)
+    minutes, rem = divmod(rem, 6000)
+    secs, centiseconds = divmod(rem, 100)
     return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
 
 def srt_time_to_seconds(time_str):
@@ -214,9 +278,9 @@ def srt_time_to_seconds(time_str):
             minutes = int(parts[1])
             sec_frac = parts[2].split('.')
             seconds = int(sec_frac[0])
-            millis = int(sec_frac[1]) if len(sec_frac) > 1 else 0
+            millis = int((sec_frac[1] + '000')[:3]) if len(sec_frac) > 1 else 0
             return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
-    except:
+    except Exception:
         return None
     return None
 
@@ -226,8 +290,8 @@ def merge_bilingual(zh_file, en_file):
         return None, "请上传中文和英文字幕文件"
 
     try:
-        zh_content = Path(zh_file.name).read_text(encoding='utf-8')
-        en_content = Path(en_file.name).read_text(encoding='utf-8')
+        zh_content = read_text_smart(zh_file.name)
+        en_content = read_text_smart(en_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -246,7 +310,7 @@ def merge_bilingual(zh_file, en_file):
         })
 
     result = build_srt(merged)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"bilingual_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ 合并成功，文件保存在 {out_path}"
@@ -257,7 +321,7 @@ def srt_to_txt(srt_file):
         return None, "请上传SRT文件"
 
     try:
-        content = Path(srt_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(srt_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -265,7 +329,7 @@ def srt_to_txt(srt_file):
     lines = [e['text'] for e in entries]
     result = '\n'.join(lines)
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"text_{timestamp}.txt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ 转换成功，文件保存在 {out_path}"
@@ -279,7 +343,7 @@ def add_pinyin_to_srt(srt_file, tone_style):
         return None, "请上传SRT文件"
 
     try:
-        content = Path(srt_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(srt_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -303,7 +367,7 @@ def add_pinyin_to_srt(srt_file, tone_style):
             'text': new_text
         })
     result = build_srt(new_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"pinyin_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ 拼音添加成功，文件保存在 {out_path}"
@@ -314,7 +378,7 @@ def text_to_srt(text_file, default_duration):
         return None, "请上传文本文件"
 
     try:
-        content = Path(text_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(text_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -363,7 +427,7 @@ def text_to_srt(text_file, default_duration):
         })
 
     result = build_srt(srt_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"from_text_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ 转换成功，文件保存在 {out_path}"
@@ -374,7 +438,7 @@ def lrc_to_srt(lrc_file, default_duration):
         return None, "请上传LRC文件"
 
     try:
-        content = Path(lrc_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(lrc_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -400,7 +464,7 @@ def lrc_to_srt(lrc_file, default_duration):
         })
 
     result = build_srt(srt_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"from_lrc_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ 转换成功，文件保存在 {out_path}"
@@ -410,13 +474,15 @@ def srt_to_ass(srt_file):
     if srt_file is None:
         return None, "请上传SRT文件"
     try:
-        content = Path(srt_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(srt_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
     entries_srt = parse_srt(content)
     ass_entries = []
     for e in entries_srt:
-        time_part = e['timecode'].split(' --> ')
+        # 修复：原写法 split(' --> ') 只认「带空格的箭头」，
+        # "00:00:01,000-->00:00:02,000" 这类 SRT 会被整条丢弃（甚至报「解析SRT失败」）
+        time_part = re.split(r'\s*-->\s*', e['timecode'].strip())
         if len(time_part) == 2:
             start_srt = time_part[0].strip()
             end_srt = time_part[1].strip()
@@ -431,7 +497,7 @@ def srt_to_ass(srt_file):
     if not ass_entries:
         return None, "解析SRT失败"
     ass_content = build_ass(ass_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"converted_{timestamp}.ass"
     out_path.write_text(ass_content, encoding='utf-8')
     return str(out_path), f"✅ SRT转ASS成功，文件保存在 {out_path}"
@@ -440,7 +506,7 @@ def ass_to_srt(ass_file):
     if ass_file is None:
         return None, "请上传ASS文件"
     try:
-        content = Path(ass_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(ass_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
     ass_entries = parse_ass(content)
@@ -456,7 +522,7 @@ def ass_to_srt(ass_file):
             'text': item['text']
         })
     result = build_srt(srt_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"converted_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ ASS转SRT成功，文件保存在 {out_path}"
@@ -465,7 +531,7 @@ def ass_to_txt(ass_file):
     if ass_file is None:
         return None, "请上传ASS文件"
     try:
-        content = Path(ass_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(ass_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
     ass_entries = parse_ass(content)
@@ -473,7 +539,7 @@ def ass_to_txt(ass_file):
         return None, "未找到有效的ASS对话行"
     text_lines = [item['text'] for item in ass_entries]
     result = '\n'.join(text_lines)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"ass_text_{timestamp}.txt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ ASS转TXT成功，文件保存在 {out_path}"
@@ -482,7 +548,7 @@ def txt_to_srt_simple(txt_file, duration_mode, fixed_duration, chars_per_second)
     if txt_file is None:
         return None, "请上传TXT文件"
     try:
-        content = Path(txt_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(txt_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
     lines = [line.strip() for line in content.split('\n') if line.strip()]
@@ -516,7 +582,7 @@ def txt_to_srt_simple(txt_file, duration_mode, fixed_duration, chars_per_second)
             'text': item['text']
         })
     result = build_srt(srt_entries)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_path = OUTPUT_DIR / f"simple_txt_{timestamp}.srt"
     out_path.write_text(result, encoding='utf-8')
     return str(out_path), f"✅ TXT转SRT成功，文件保存在 {out_path}"
@@ -542,7 +608,7 @@ def convert_subtitle_file(input_file, convert_mode, output_format):
         return None, "请上传字幕文件"
 
     try:
-        content = Path(input_file.name).read_text(encoding='utf-8')
+        content = read_text_smart(input_file.name)
     except Exception as e:
         return None, f"读取文件失败: {e}"
 
@@ -591,7 +657,7 @@ def convert_subtitle_file(input_file, convert_mode, output_format):
         "t2s": "繁转简", "s2t": "简转繁",
         "t2tw": "繁转台", "t2hk": "繁转港"
     }
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     if output_format == "same":
         suffix = ext.lstrip('.')
     else:
@@ -853,10 +919,34 @@ with gr.Blocks(title="字幕处理工具箱", theme=gr.themes.Default()) as demo
     """)
 # ==================== 结尾 ====================
 
-demo.queue().launch(
-    server_name="127.0.0.1",
-    server_port=18009,
-    inbrowser=True,
-    show_error=True,
-    allowed_paths=[str(OUTPUT_DIR)]   
-)
+# 端口候选。
+# 修复：原先硬编码 18009 且**没有回退**，而 18009 落在 whisperX.py / _pro.py /
+# _basic.py 的 18006-18010 段内。用户开了几个「语音转字幕」再点「字幕转换」时，
+# 本脚本会直接抛
+#   OSError: Cannot find empty port in range: 18009-18009
+# 崩掉，界面上表现为「点了没反应」。
+LAUNCH_PORTS = [18021, 18022, 18023, 18024, 18025]
+
+
+def launch_server():
+    """依次尝试候选端口启动，全部被占用时明确报错而不是静默崩掉。"""
+    for port in LAUNCH_PORTS:
+        try:
+            demo.queue().launch(
+                server_name="127.0.0.1",
+                server_port=port,
+                inbrowser=True,
+                show_error=True,
+                allowed_paths=[str(OUTPUT_DIR)]
+            )
+            return
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+    print(f"[错误] 候选端口全部被占用，无法启动: {LAUNCH_PORTS}")
+
+
+# 修复：原先 demo.queue().launch(...) 直接写在模块级（无 __main__ 保护），
+# 导致本文件无法被 import —— 一 import 就起服务并阻塞，
+# 与其他脚本（clean_subtitle / AI_translator / subtitle_translator_pro）写法也不一致。
+if __name__ == "__main__":
+    launch_server()

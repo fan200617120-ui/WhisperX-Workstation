@@ -47,63 +47,106 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CUSTOM_WORDS_PATH = SCRIPT_DIR / "custom_words.txt"
 
-# 内置语气词库
+# 句中/首尾标点集合（用于删除语气词后清理残留标点）
+_PUNCT = "，。！？；：、…"
+
+# 内置语气词库：只收录「不承载语义」的纯语气词与笑声。
+# 默认模式仅删除这一组，避免把正文吃掉。
+# 修复：原词库混入了「这个/那个/然后/就是/的话/所以/但是」等实义词，
+#      且首尾删除不受激进开关约束，导致默认模式下 "他说的话" → "他说"。
 DEFAULT_FILLER_WORDS = {
     "啊", "呀", "呢", "吧", "吗", "嘛", "噢", "哦", "哟", "咳", "唉",
     "嗨", "嘿", "喂", "嗯", "呃", "哎", "喔", "呵", "哈", "嘻", "哼",
     "哇", "呐", "咯", "哩", "咧", "啦", "啰", "喽",
     "哎呀", "哎哟", "哎呦", "啊呀", "啊哟", "啊哈", "嗯哼", "呃呃", "哎哎",
     "哈哈", "呵呵", "嘿嘿", "嘻嘻", "咳咳", "唉呀", "唉哟", "哦哦", "噢噢",
-    "哎哟喂", "我的天", "天呐", "老天", "我的妈", "妈呀",
+    "哎哟喂", "天呐", "妈呀",
+}
+
+# 话语标记词：删掉会改变语义（"他说的话" → "他说"），
+# 也可能误伤词头（"老天爷" → "爷"），因此只在「激进模式」下启用。
+DEFAULT_DISCOURSE_WORDS = {
     "这个", "那个", "然后", "就是", "的话", "那么", "所以", "但是", "而且",
     "不过", "然而", "因此", "因而", "于是", "接下来", "实际上", "其实呢",
     "就是说", "我们说", "可以说", "换句话说", "也就是说", "大家知道",
     "我们知道", "应该说", "老实说", "说实话", "坦率地说",
+    "我的天", "我的妈", "老天",
 }
 
 
-def safe_read_file(file_path, encodings=('utf-8', 'gbk', 'gb2312', 'latin-1')):
-    """尝试多种编码读取文件，解决编码硬编码问题"""
+def safe_read_file(file_path, encodings=('utf-8-sig', 'utf-8', 'gb18030', 'utf-16')):
+    """尝试多种编码读取文件，解决编码硬编码问题。
+
+    修复：原列表末尾是 'latin-1'，它对任意字节序列都能解码成功、永不抛异常，
+    导致 UTF-16 等未列出的编码读出满屏乱码却仍被当成「读取成功」，
+    第 73 行的 raise 变成死代码。
+    现改为：utf-8-sig（兼容 BOM）、utf-8、gb18030（GBK/GB2312 超集）、utf-16。
+    """
     for enc in encodings:
         try:
             with open(file_path, 'r', encoding=enc) as f:
                 return f.read()
-        except (UnicodeDecodeError, UnicodeError):
+        except (UnicodeDecodeError, UnicodeError, LookupError):
             continue
     raise ValueError(f"无法识别文件编码，已尝试: {encodings}")
 
 
+def gen_timestamp():
+    """带毫秒的时间戳。修复：原 %H%M%S 只精确到秒，
+    同一秒内连续点击会覆盖上一次的输出文件。"""
+    return time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+
+
 def is_srt_content(text):
-    """使用时间轴正则严格检测SRT格式（修复bug3）"""
-    # 匹配典型时间轴行：00:00:01,000 --> 00:00:04,000
-    pattern = r'\d+:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d+:\d{2}:\d{2}[.,]\d{3}'
+    """使用时间轴正则检测SRT/VTT格式。
+
+    修复：原正则要求小时两位且毫秒必须三位，导致
+    "00:00:01,00 --> ..."、"0:00:01,000"、VTT 的 "00:01.000" 全部漏判，
+    被当成 TXT 走 clean_txt，输出后缀变成 .txt。
+    """
+    pattern = (r'\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}'
+               r'\s*-->\s*'
+               r'\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}')
     return bool(re.search(pattern, text))
 
 
 class SubtitleCleaner:
     def __init__(self):
         self.filler_words = DEFAULT_FILLER_WORDS.copy()
+        self.discourse_words = DEFAULT_DISCOURSE_WORDS.copy()
         self.custom_words = set()
 
     def set_custom_words(self, words_str):
         """设置自定义词库（从字符串按行解析）"""
         custom = set()
-        for line in words_str.strip().split('\n'):
+        for line in (words_str or '').strip().split('\n'):
             w = line.strip()
             if w:
                 custom.add(w)
         self.custom_words = custom
 
-    def get_all_fillers(self):
-        return self.filler_words.union(self.custom_words)
+    def get_all_fillers(self, aggressive=False):
+        """默认模式只返回纯语气词；激进模式才叠加话语标记词。
+        自定义词库在两种模式下都生效（用户显式添加的，尊重其意图）。"""
+        words = set(self.filler_words)
+        if aggressive:
+            words |= self.discourse_words
+        return words | self.custom_words
 
-    def clean_text(self, text, aggressive=True):
-        """清洗单行文本（修复开头/结尾循环删除，激进模式安全删除）"""
+    def clean_text(self, text, aggressive=False):
+        """清洗单行文本。
+
+        修复：首尾删除原先不受 aggressive 开关约束，导致默认模式就删掉
+        "这个/那个/的话/所以" 等实义词（"他说的话" → "他说"）。现改为：
+        - 默认模式：只删纯语气词（DEFAULT_FILLER_WORDS + 自定义词库）
+        - 激进模式：叠加话语标记词，并启用句中删除
+        """
         if not text:
             return text
         original = text.strip()
-        all_fillers = self.get_all_fillers()
-        sorted_fillers = sorted(all_fillers, key=len, reverse=True)
+        if not original:
+            return text
+        sorted_fillers = sorted(self.get_all_fillers(aggressive), key=len, reverse=True)
 
         # 循环删除开头语气词（修复bug8）
         while True:
@@ -112,7 +155,7 @@ class SubtitleCleaner:
                 if original.startswith(filler):
                     original = original[len(filler):].lstrip()
                     # 如果紧跟着标点，也一并去除
-                    if original and original[0] in "，、；：":
+                    if original and original[0] in _PUNCT:
                         original = original[1:].lstrip()
                     changed = True
                     break
@@ -125,7 +168,7 @@ class SubtitleCleaner:
             for filler in sorted_fillers:
                 if original.endswith(filler):
                     original = original[:-len(filler)].rstrip()
-                    if original and original[-1] in "，、；：":
+                    if original and original[-1] in _PUNCT:
                         original = original[:-1].rstrip()
                     changed = True
                     break
@@ -143,11 +186,22 @@ class SubtitleCleaner:
                 original = re.sub(pattern, r'\1', original)
                 # 去除可能产生的多余空格
                 original = re.sub(r'\s+', ' ', original).strip()
+            # 修复：删词后可能留下重复标点（"好的，然后，我们走" → "好的，，我们走"）
+            original = re.sub(r'([，。！？；：、])\1+', r'\1', original)
 
-        return original.strip()
+        result = original.strip()
+        # 兜底：整行都是语气词时不要清空，否则整条字幕会消失
+        return result if result else text.strip()
 
-    def clean_srt(self, content, aggressive=True):
-        """清洗SRT格式字幕，保留时间轴（修复多行合并问题bug6，修复吞序号bug2）"""
+    def clean_srt(self, content, aggressive=False):
+        """清洗SRT格式字幕，保留时间轴（修复多行合并问题bug6，修复吞序号bug2）
+
+        修复：
+        1. 序号行后面不是时间轴时，原代码把 `line`（旧值）又 append 一次，
+           导致数字行输出两遍；现改为只 append 一次，后续行交给循环正常处理。
+        2. 非序号开头的行原先原样输出、完全不清洗，导致 VTT（无序号）等
+           输入提示「清洗成功」但内容一字未改；现改为统一走 clean_text。
+        """
         lines = content.split('\n')
         result = []
         i = 0
@@ -178,16 +232,18 @@ class SubtitleCleaner:
                         ]
                         result.append('\n'.join(cleaned_lines))
                     result.append('')  # 空行
-                else:
-                    # 没有时间轴，原样保留
-                    result.append(line)
-                    i += 1
+                # 没有时间轴：不重复 append 序号，也不吞掉下一行，
+                # 让循环继续正常处理（修复数字行重复输出）
             else:
-                result.append(line)
+                # 非序号行同样要清洗（修复 VTT 等无序号输入「假成功」）
+                if line:
+                    result.append(self.clean_text(line, aggressive))
+                else:
+                    result.append('')
                 i += 1
         return '\n'.join(result)
 
-    def clean_txt(self, content, aggressive=True):
+    def clean_txt(self, content, aggressive=False):
         """清洗纯文本，按行处理"""
         lines = content.split('\n')
         cleaned = []
@@ -218,7 +274,7 @@ def save_custom_words_file(words_content):
     """将词库内容保存到输出目录并返回下载路径（修复bug5）"""
     if not words_content.strip():
         return None
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_name = f"custom_words_{timestamp}.txt"
     out_path = OUTPUT_DIR / out_name
     with open(out_path, 'w', encoding='utf-8') as f:
@@ -253,7 +309,7 @@ def process_file(file, aggressive, custom_words, file_type):
         cleaned = cleaner.clean_txt(content, aggressive)
         suffix = ".txt"
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     stem = Path(file.name).stem
     out_filename = f"{stem}_cleaned_{timestamp}{suffix}"
     out_path = OUTPUT_DIR / out_filename
@@ -279,7 +335,7 @@ def process_text(text, aggressive, custom_words):
         cleaned = cleaner.clean_txt(text, aggressive)
         suffix = ".txt"
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = gen_timestamp()
     out_filename = f"text_cleaned_{timestamp}{suffix}"
     out_path = OUTPUT_DIR / out_filename
     with open(out_path, 'w', encoding='utf-8') as f:
@@ -299,7 +355,7 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
     if DEFAULT_CUSTOM_WORDS_PATH.exists():
         try:
             default_custom_content = safe_read_file(DEFAULT_CUSTOM_WORDS_PATH)
-        except:
+        except Exception:
             default_custom_content = ""
     else:
         default_custom_content = ""
@@ -423,5 +479,25 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
     </div>
     """)
 
+# 端口候选。
+# 修复：原先硬编码 18007 且**没有回退**，而 18007 落在 whisperX.py / _pro.py /
+# _basic.py 的 18006-18010 段内。用户开了两个「语音转字幕」再点「字幕清洗」时，
+# 本脚本会直接抛
+#   OSError: Cannot find empty port in range: 18007-18007
+# 崩掉，界面上表现为「点了没反应」。
+LAUNCH_PORTS = [18016, 18017, 18018, 18019, 18020]
+
+
+def launch_server():
+    """依次尝试候选端口启动，全部被占用时明确报错而不是静默崩掉。"""
+    for port in LAUNCH_PORTS:
+        try:
+            demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=True)
+            return
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+    print(f"[错误] 候选端口全部被占用，无法启动: {LAUNCH_PORTS}")
+
+
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=18007, inbrowser=True)
+    launch_server()

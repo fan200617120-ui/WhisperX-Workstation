@@ -35,7 +35,10 @@ def clean_old_logs(days=7):
 
 clean_old_logs()
 log_file = LOG_DIR / f"error_{time.strftime('%Y%m%d')}.log"
-logging.basicConfig(filename=log_file, level=logging.ERROR,
+# 修复：原级别为 logging.ERROR，但关键信息是用 logger.warning / logger.info 输出的
+# （例如第 714 行「精细对齐出错，将使用原始时间戳」），这些永远不会落盘，
+# 用户界面上只看到「完成」，无从知道精细对齐其实没生效。改为 INFO。
+logging.basicConfig(filename=log_file, level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,51 @@ config_lock = threading.RLock()
 
 CACHE_DIR = ROOT_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+# ==================== 陈旧缓存清理 ====================
+# 为什么要这个：分段副本（*_part_*.wav，总和 ≈ 原文件大小）和预处理副本
+# （*_16k_mono.wav）在任务正常结束时会清理（_clean_sink / cleanup_temp），
+# 但**进程被强杀或崩溃时不会** —— 跑一次 51 分钟长音频就能在 cache/ 留下约 98MB。
+# 实测 cache/ 曾积到 477MB，其中约 210MB 是一次异常退出的残留。
+#
+# 只删「超过 CACHE_TTL_HOURS 的」，所以本次会话正在用的文件（几分钟前才创建）
+# 不会被碰到；即使有另一个脚本正在跑长任务，它的分段文件也不会老到这个岁数
+# （没有任何单文件转写会跑满 12 小时）。
+CACHE_TTL_HOURS = 12
+
+def clean_old_cache_files(hours=CACHE_TTL_HOURS):
+    """清理 cache/ 里陈旧的任务临时文件，返回删除数量。
+
+    两道条件都满足才删，避免误伤用户自己放进 cache/ 的东西：
+      1. 文件名像程序自己产生的（tmp* / sub_*）且扩展名是 .wav / .srt；
+      2. 修改时间早于 hours 小时前。
+    子目录一律不动。
+    """
+    cutoff = time.time() - hours * 3600
+    removed = 0
+    try:
+        for f in CACHE_DIR.iterdir():
+            if f.is_dir() or f.suffix.lower() not in (".wav", ".srt"):
+                continue
+            name = f.name.lower()
+            if not name.isascii():
+                continue        # 中文名基本都是用户自己放进来的素材
+            if not (name.startswith("tmp") or name.startswith("sub_")):
+                continue
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
+_cleaned_cache = clean_old_cache_files()
+if _cleaned_cache:
+    print(f"已清理 {_cleaned_cache} 个陈旧缓存文件"
+          f"（cache/ 中超过 {CACHE_TTL_HOURS} 小时的临时音频）")
 
 # ==================== FFmpeg ====================
 PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
@@ -101,8 +149,10 @@ def save_settings(settings):
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        # 修复：原来静默吞掉，设置写盘失败时用户改了输出目录却不知道为什么没生效
+        print(f"[WARN] 设置保存失败（{CONFIG_FILE}）: {e}")
+        logger.warning(f"设置保存失败: {e}")
 
 # ==================== 导入依赖 ====================
 try:
@@ -342,6 +392,28 @@ def clean_cjk_spaces(text: str) -> str:
         text = re.sub(rf'(?<=[{_CJK_RANGE}])\s+(?=[{_CJK_RANGE}])', '', text)
     return text
 
+def _join_segment_texts(segments):
+    """按相邻边界逐对决定连接符。
+
+    修复：原实现先算 `has_cjk = 整篇任意一段含 CJK`，只要视频里出现过一个汉字，
+    所有段落就都用 "" 拼接。中英混排（中文解说夹英文术语）时英文句之间空格丢失，
+    导出成 "...Englishand more"。现改为只看相邻两段的边界字符。
+    """
+    cjk = re.compile(rf'[{_CJK_RANGE}]')
+    parts = []
+    for seg in segments:
+        t = (seg.get("text") or "").strip()
+        if not t:
+            continue
+        if parts:
+            prev_cjk = bool(cjk.search(parts[-1][-1:]))
+            cur_cjk = bool(cjk.search(t[:1]))
+            # 两侧都不是 CJK 时才补空格（英文句间需要空格）
+            if not prev_cjk and not cur_cjk:
+                parts.append(" ")
+        parts.append(t)
+    return "".join(parts)
+
 def format_result_to_outputs(result, **kwargs):
     if not result or not isinstance(result, dict):
         return "无结果", "{}", "", []
@@ -363,9 +435,7 @@ def format_result_to_outputs(result, **kwargs):
             for w in seg_cp['words']:
                 w['word'] = clean_cjk_spaces(w['word'])
         cleaned_segments.append(seg_cp)
-    has_cjk = any(re.search(rf'[{_CJK_RANGE}]', seg.get("text", "")) for seg in cleaned_segments)
-    join_char = "" if has_cjk else " "
-    text = join_char.join([seg["text"] for seg in cleaned_segments])
+    text = _join_segment_texts(cleaned_segments)
     ts_json = json.dumps(cleaned_segments, ensure_ascii=False, indent=2)
     srt = []
     for i, seg in enumerate(cleaned_segments, 1):
@@ -461,6 +531,35 @@ def match_local_align_by_lang(lang, local_align):
                 return path
     return None
 
+# ==================== 精度支持查询 ====================
+# 精度候选（顺序即下拉框显示顺序，与原默认保持一致：int8_float32 优先）
+_COMPUTE_PREFERENCE = ["int8_float32", "float16", "float32", "int8_float16",
+                       "int8", "int16", "bfloat16"]
+
+
+def supported_compute_types(device):
+    """查询 CTranslate2 在该设备上**真正支持**的精度。
+
+    修复：界面原本无条件提供 ["int8_float32", "float16", "float32"]，
+    但 float16 能不能用取决于显卡。实测 GTX 1080（算力 6.1）在
+    ctranslate2 4.4.0 下 CUDA 只支持 {int8, int8_float32, float32}，
+    **不支持 float16** —— 用户在下拉框选了 float16 必然报
+    "Requested float16 compute type, but the target device or backend
+     do not support efficient float16 computation."。
+    现改为按实际支持的精度构造下拉框，并在加载时做运行时校验。
+    """
+    try:
+        import ctranslate2
+        supported = set(ctranslate2.get_supported_compute_types(device))
+    except Exception as e:
+        print(f"[WARN] 无法查询 {device} 支持的精度（{e}），回退默认列表")
+        supported = {"int8_float32", "float32"}
+        if device != "cpu":
+            supported.add("float16")
+    choices = [c for c in _COMPUTE_PREFERENCE if c in supported]
+    return choices or ["int8_float32", "float32"]
+
+
 # ==================== 模型管理器 ====================
 class WhisperXManager:
     def __init__(self):
@@ -477,6 +576,7 @@ class WhisperXManager:
         self.original_input_name = None
         self.asr_in_use = 0    # 转写占用计数：转写进行中禁止切换/卸载 ASR 模型，防止显存峰值翻倍
         self.align_in_use = 0  # 对齐占用计数：对齐进行中禁止卸载对齐模型
+        self.last_align_error = ""  # 最近一次精细对齐的失败原因（用于在界面上如实告知用户）
 
     def get_available_local_models(self):
         """过滤 wav2vec2/xlsr 对齐模型目录，避免出现在 ASR 模型列表中。"""
@@ -511,8 +611,13 @@ class WhisperXManager:
         with self.lock:
             if not model_size:
                 return False, "未发现模型：请先在 pretrained_models 目录放置模型文件，然后刷新页面后重试"
-            if device == "cpu" and compute_type == "float16":
-                return False, "CPU 模式不支持 float16，请选择 int8_float32 或 float32"
+            # 修复：原校验只拦 CPU+float16。实测 GTX 1080 上 CUDA 也不支持 float16
+            # （ctranslate2 4.4.0 在算力 6.1 上只给 {int8, int8_float32, float32}），
+            # 现改为按「该设备实际支持的精度」做通用校验。
+            _ok_types = supported_compute_types(device)
+            if compute_type not in _ok_types:
+                return False, (f"{device} 不支持 {compute_type}，"
+                               f"请选择: {'、'.join(_ok_types)}")
             local_path = ROOT_DIR / "pretrained_models" / model_size
             if local_path.exists() and ((local_path / "model.bin").exists() or (local_path / "config.json").exists()):
                 model_name_or_path = str(local_path)
@@ -638,7 +743,9 @@ class WhisperXManager:
 
     def apply_whisperx_align(self, result, audio_path, language, device, model_choice):
         if not WHISPERX_ALIGN_AVAILABLE:
+            self.last_align_error = "未安装 whisperx.align，无法精细对齐"
             return result
+        self.last_align_error = ""
         try:
             local_align = self.get_local_align_models()
             align_model_path = None
@@ -689,7 +796,11 @@ class WhisperXManager:
                 with self.lock:
                     self.align_in_use = max(0, self.align_in_use - 1)
         except Exception as e:
+            # 修复：原来只写 logger.warning（级别被设成 ERROR 时连日志都不落），
+            # 界面照常显示「完成」，用户以为做了精细对齐。现同时记到实例属性，
+            # 由调用方在结果提示里如实告知。
             logger.warning(f"精细对齐出错: {e}，将使用原始时间戳。")
+            self.last_align_error = str(e)
         return result
 
     def cleanup_temp(self):
@@ -720,13 +831,17 @@ class WhisperXManager:
             try:
                 cmd = [FFMPEG_PATH, "-y", "-i", audio_input, "-ar", "16000",
                        "-ac", "1", "-c:a", "pcm_s16le", temp_16k]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+                # 修复：原来没设 text/encoding，stderr 是 bytes 且被丢弃，
+                # 失败时只看到 "returned non-zero exit status 1"，无法定位原因
+                subprocess.run(cmd, check=True, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', timeout=600)
             except Exception as e:
+                stderr = getattr(e, 'stderr', '') or ''
                 try:
                     os.unlink(temp_16k)
                 except Exception:
                     pass
-                logger.error(f"音频预处理失败: {e}")
+                logger.error(f"音频预处理失败: {e}\n{(stderr or '')[-500:]}")
                 return None
             (sink if sink is not None else self.temp_files).append(temp_16k)
             return temp_16k
@@ -741,7 +856,8 @@ class WhisperXManager:
             try:
                 cmd = [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
                        "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace', check=True, timeout=30)
                 return float(result.stdout.strip())
             except Exception:
                 return None
@@ -775,7 +891,8 @@ class WhisperXManager:
                 str(temp_file),
             ]
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+                subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
                 temp_files.append(str(temp_file))
                 sink.append(str(temp_file))
             except Exception as e:
@@ -919,6 +1036,17 @@ def _build_split_notes(result, enable_align):
         notes.append(f"⚠ {result['failed_parts']} 个片段转写失败，对应时间段字幕缺失")
     return "；".join(notes)
 
+def _align_fallback_note(reason: str) -> str:
+    """精细对齐失败时的用户可见提示。
+
+    修复：原先对齐失败只写 logger.warning（日志级别为 ERROR 时连日志都不落），
+    界面照常显示「完成」，用户以为拿到了精细对齐的时间戳。
+    """
+    r = (reason or "").strip().replace("\n", " ")
+    if len(r) > 140:
+        r = r[:140] + "…"
+    return f"⚠ 精细对齐未生效，已回退为 ASR 原始时间戳（原因：{r}）"
+
 def transcribe_audio(audio, model_size, device, compute_type, language, beam_size,
                      vad_filter, vad_onset, vad_offset, vad_min_speech, vad_min_silence,
                      hotwords, enable_align, align_model,
@@ -961,6 +1089,8 @@ def transcribe_audio(audio, model_size, device, compute_type, language, beam_siz
         if enable_align and not result.get("split_used"):
             progress(0.6, desc="精细对齐...")
             result = manager.apply_whisperx_align(result, audio_path, lang, device, align_model)
+            if manager.last_align_error:
+                notes = ((notes + "；") if notes else "") + _align_fallback_note(manager.last_align_error)
         progress(0.7, desc="生成输出...")
         split_args = build_split_kwargs(enable_duration_split, max_duration, enable_char_split,
                                         max_chars, enable_silence_split, max_silence_ms,
@@ -1012,7 +1142,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         temp_audio_path = audio_path
         cmd = [FFMPEG_PATH, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
                "-ar", "16000", "-ac", "1", "-y", audio_path]
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
         progress(0.4, desc="转写中...")
         lang = _norm_lang(language)
         prompt = hotwords.strip() if hotwords else None
@@ -1031,6 +1162,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         if enable_align and not result.get("split_used"):
             progress(0.6, desc="精细对齐...")
             result = manager.apply_whisperx_align(result, audio_path, lang, device, align_model)
+            if manager.last_align_error:
+                notes = ((notes + "；") if notes else "") + _align_fallback_note(manager.last_align_error)
         progress(0.7, desc="生成字幕...")
         split_args = build_split_kwargs(enable_duration_split, max_duration, enable_char_split,
                                         max_chars, enable_silence_split, max_silence_ms,
@@ -1054,7 +1187,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             cmd = [FFMPEG_PATH, "-i", video_path, "-i", str(srt_path), "-c", "copy",
                    "-c:s", "mov_text", "-metadata:s:s:0", f"language={sub_lang_code}",
                    "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
         else:
             safe_srt_temp = os.path.join(str(CACHE_DIR), f"sub_{uuid.uuid4().hex[:8]}.srt")
             shutil.copy2(str(srt_path), safe_srt_temp)
@@ -1066,7 +1200,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             vf_str = (f"subtitles='{escaped_srt}':force_style='FontName={font_name},"
                       f"FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H000000,BorderStyle=3'")
             cmd = [FFMPEG_PATH, "-i", video_path, "-vf", vf_str, "-c:a", "copy", "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=3600)
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=3600)
         result_msg = (f"✅ 处理完成！输出视频: {out_path.name}\n"
                       f"字幕文件已保存至 output 目录。\n\n【识别文本】\n{full_text}")
         if notes:
@@ -1147,6 +1282,7 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
                     audio_path = None
             orig_name = normalize_file_input(fobj)[1] or f"file_{i + 1}"
             progress((i + 1) / total, desc=f"处理 {i + 1}/{total}: {orig_name}")
+            batch_align_note = ""   # 本文件的精细对齐失败提示（逐文件重置）
             # 2. 立即提交下一个文件的预处理（CPU 与当前 GPU 推理重叠）
             if i + 1 < len(files):
                 future_prep, next_sink = submit_prep(i + 1)
@@ -1166,11 +1302,15 @@ def transcribe_batch(files, model_size, device, compute_type, language, beam_siz
                     continue
                 if enable_align and not result.get("split_used"):
                     result = manager.apply_whisperx_align(result, audio_path, lang, device, align_model)
+                    if manager.last_align_error:
+                        batch_align_note = _align_fallback_note(manager.last_align_error)
                 full_text, tsjson, srt_text, _ = format_result_to_outputs(result, **split_args)
                 save_outputs(orig_name, full_text, tsjson, srt_text,
                              language=result.get("language", "未知"))
                 line = f"✅ {orig_name}: 已保存"
                 note = _build_split_notes(result, enable_align)
+                if batch_align_note:
+                    note = ((note + "；") if note else "") + batch_align_note
                 if note:
                     line += f"（{note}）"
                 results_text.append(line)
@@ -1235,7 +1375,11 @@ def create_interface():
         device_choices = ["cuda", "cpu"]
     else:
         device_choices = ["cpu"]
-    compute_choices = ["int8_float32", "float16", "float32"]
+    # 修复：原写法硬编码 ["int8_float32","float16","float32"]，无条件提供 float16。
+    # 实测 GTX 1080（算力 6.1）在 ctranslate2 4.4.0 下 CUDA 不支持 float16，
+    # 用户选了必然加载失败。现按该设备实际支持的精度构造。
+    compute_choices = supported_compute_types(device_choices[0])
+    print(f"[OK] {device_choices[0]} 支持的精度: {compute_choices}")
     align_local = manager.get_local_align_models()
     align_options = ["auto"] + [name for name, _ in align_local]
 
@@ -1247,7 +1391,7 @@ def create_interface():
                 model_size = gr.Dropdown(label="模型大小", choices=model_choices,
                                          value=model_choices[0] if model_choices else None,
                                          interactive=bool(model_choices))
-                compute_type = gr.Dropdown(label="计算类型", choices=compute_choices, value="int8_float32")
+                compute_type = gr.Dropdown(label="计算类型", choices=compute_choices, value=compute_choices[0])
                 language = gr.Dropdown(label="语言 (auto=自动检测)", choices=LANG_CHOICES,
                                        value="auto", allow_custom_value=True)
             with gr.Row():

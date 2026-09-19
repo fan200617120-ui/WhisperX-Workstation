@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"   
 chcp 65001 >nul
 title 语音字幕工作站 凡哥制作
 color 0B
@@ -16,6 +17,8 @@ echo       轻舟渡万境，一智载千寻!
 echo ========================================
 echo.
 
+set TRANSFORMERS_OFFLINE=1
+set HF_HUB_OFFLINE=1
 set "PROJECT_ROOT=%~dp0"
 set "PROJECT_ROOT=%PROJECT_ROOT:~0,-1%"
 set "PYTHON_DIR=%PROJECT_ROOT%\python_embeded"

@@ -48,54 +48,68 @@ class OnlineTranslator:
         return str(output_dir)
 
     def parse_srt(self, srt_content: str) -> List[Dict]:
-        """解析SRT字幕格式"""
+        """解析SRT字幕格式
+
+        修复：
+        1) 文件带 UTF-8 BOM 时首行是 '\\ufeff1'，isdigit() 为 False，
+           于是走 else 分支把序号行当成时间轴行，正则匹配失败 → 第一条字幕凭空消失。
+        2) 时间轴正则要求小时恰好两位，'0:00:01,000' 这类会被整条丢弃。
+        3) 空文本块（序号 + 时间轴两行）被 len(lines) >= 3 丢掉。
+        """
         subtitles = []
         srt_content = srt_content.replace('\r\n', '\n').replace('\r', '\n')
+        # 剥离 BOM
+        srt_content = srt_content.lstrip('\ufeff')
         blocks = re.split(r'\n\s*\n', srt_content.strip())
-        
+
         for block in blocks:
             lines = block.strip().split('\n')
-            if len(lines) >= 3:
-                try:
-                    if lines[0].strip().isdigit():
-                        index = int(lines[0])
-                        timecode_line = lines[1]
-                        text_lines = lines[2:]
-                    else:
-                        index = len(subtitles) + 1
-                        timecode_line = lines[0]
-                        text_lines = lines[1:]
+            if not lines or not lines[0]:
+                continue
+            try:
+                if lines[0].strip().isdigit():
+                    index = int(lines[0])
+                    timecode_line = lines[1] if len(lines) > 1 else ''
+                    text_lines = lines[2:]
+                else:
+                    index = len(subtitles) + 1
+                    timecode_line = lines[0]
+                    text_lines = lines[1:]
 
-                    time_match = re.search(r'(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})', timecode_line)
-                    if time_match:
-                        start_time = time_match.group(1).replace(',', '.')
-                        end_time = time_match.group(2).replace(',', '.')
-                    else:
-                        continue
-
-                    text = '\n'.join(text_lines).strip()
-                    if text:
-                        subtitles.append({
-                            'index': index,
-                            'start_time': start_time,
-                            'end_time': end_time,
-                            'original_text': text,
-                            'translated_text': '',
-                        })
-                except Exception as e:
-                    print(f"解析SRT块失败: {e}")
+                time_match = re.search(
+                    r'(\d{1,3}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,3}:\d{2}:\d{2}[,.]\d{1,3})',
+                    timecode_line)
+                if not time_match:
                     continue
+                start_time = time_match.group(1).replace(',', '.')
+                end_time = time_match.group(2).replace(',', '.')
+
+                text = '\n'.join(text_lines).strip()
+                if text:
+                    subtitles.append({
+                        'index': index,
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'original_text': text,
+                        'translated_text': '',
+                    })
+            except Exception as e:
+                print(f"解析SRT块失败: {e}")
+                continue
         return subtitles
 
     def parse_txt(self, txt_content: str) -> List[Dict]:
-        """解析TXT字幕格式"""
+        """解析TXT字幕格式
+
+        修复：原用 enumerate(lines, 1) 的行号当序号，TXT 里只要有空行，
+        序号就会跳号（1,2,4,5…），导出的 SRT 序号不连续。
+        """
         subtitles = []
-        lines = txt_content.strip().split('\n')
-        for i, line in enumerate(lines, 1):
+        for line in txt_content.split('\n'):
             line = line.strip()
             if line:
                 subtitles.append({
-                    'index': i,
+                    'index': len(subtitles) + 1,
                     'original_text': line,
                     'translated_text': '',
                 })
@@ -116,23 +130,36 @@ class OnlineTranslator:
         }
         
         # 兼容不同的 base_url 格式
-        endpoint = base_url.strip()
+        # 修复：原逻辑对「已带 /v1」的地址会再拼一次，变成 /v1/v1/chat/completions，
+        # 请求打到不存在的路径返回 404。预设里的通义千问、Kimi、Ollama 三个都踩这个坑。
+        endpoint = base_url.strip().rstrip('/')
         if not endpoint.endswith("/chat/completions"):
-            if endpoint.endswith("/"):
-                endpoint += "v1/chat/completions"
-            else:
-                endpoint += "/v1/chat/completions"
+            if not re.search(r'/v\d+$', endpoint):
+                endpoint += "/v1"
+            endpoint += "/chat/completions"
 
         try:
             response = requests.post(endpoint, headers=headers, json=payload, timeout=120)
-            if response.status_code == 200:
-                result = response.json()
-                return result["choices"][0]["message"]["content"].strip()
-            else:
-                print(f"API 错误 {response.status_code}: {response.text}")
+            if response.status_code != 200:
+                print(f"API 错误 {response.status_code}: {response.text[:500]}")
                 return None
-        except Exception as e:
+            result = response.json()
+            # 修复：原写法 result["choices"][0]["message"]["content"] 在模型返回
+            # content=null（内容过滤 / 推理模型只给 reasoning_content）时抛 KeyError/TypeError
+            choices = result.get("choices") or []
+            if not choices:
+                print(f"API 返回无 choices: {str(result)[:300]}")
+                return None
+            content = (choices[0].get("message") or {}).get("content")
+            if not content:
+                print(f"API 返回空内容（可能被内容过滤）: {str(result)[:300]}")
+                return None
+            return content.strip()
+        except requests.exceptions.RequestException as e:
             print(f"API 连接异常: {e}")
+            return None
+        except Exception as e:
+            print(f"API 响应解析异常: {e}")
             return None
 
     def translate_batch_with_context(self, subtitles: List[Dict], start_idx: int, batch_size: int, 
@@ -187,22 +214,30 @@ class OnlineTranslator:
         results = {}
         if response_text:
             # 按行分割，去除可能存在的序号（如 "1. "）
-            lines = response_text.strip().split('\n')
+            lines = response_text.strip('\n').split('\n')
             cleaned_lines = []
             for line in lines:
-                # 正则去除 "1. ", "1、" 等开头
-                clean_line = re.sub(r'^\s*\d+[\.、\s]\s*', '', line).strip()
-                if clean_line:
-                    cleaned_lines.append(clean_line)
-            
-            # 匹配结果
+                # 修复：原正则 `^\s*\d+[\.、\s]\s*` 里的 \s 会让 "3 个人走了"
+                # 被误剥成 "个人走了"，这里只认「数字 + 明确分隔符」
+                clean_line = re.sub(r'^\s*\d+[\.、\)]\s*', '', line).strip()
+                cleaned_lines.append(clean_line)
+
+            # 修复：原实现把空行过滤掉，模型只要对某一条返回空行（或把一句折成两行），
+            # 后面所有译文就整体前移一位；而条数校验仍会通过 → 内容张冠李戴且无法察觉。
+            # 现改为「按位置对齐」：只裁掉首尾空行，行数不匹配就直接返回空，
+            # 交给上层回退到单句翻译。
+            while cleaned_lines and not cleaned_lines[-1]:
+                cleaned_lines.pop()
+            while cleaned_lines and not cleaned_lines[0]:
+                cleaned_lines.pop(0)
+
+            if len(cleaned_lines) != len(batch):
+                print(f"批量译文行数不匹配：期望 {len(batch)}，实得 {len(cleaned_lines)}，回退单句翻译")
+                return {}
+
             for i, text in enumerate(cleaned_lines):
-                if i < len(batch):
-                    original_idx = start_idx + i
-                    results[original_idx] = text
-                else:
-                    break # 模型输出行数过多，忽略
-        
+                results[start_idx + i] = text
+
         return results
 
     def translate_subtitles(self, subtitles: List[Dict], target_lang: str, api_key: str, 
@@ -273,9 +308,16 @@ class OnlineTranslator:
             
         return '\n'.join(srt_lines)
 
-    def save_results(self, content: str, filename: str) -> str:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(self.output_dir, f"{filename}_{timestamp}.srt")
+    def save_results(self, content: str, filename: str, suffix: str = "srt") -> str:
+        """保存翻译结果。
+
+        修复：
+        1) 原实现固定写成 .srt，但 TXT 输入生成的「SRT」没有时间轴行、格式非法，
+           播放器和剪辑软件无法导入；现按是否有时间轴决定后缀。
+        2) 时间戳原只到秒，同一秒内连续点击会覆盖上一次的结果。
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+        filepath = os.path.join(self.output_dir, f"{filename}_{timestamp}.{suffix}")
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
         return filepath
@@ -380,10 +422,21 @@ class TranslatorUI:
         return demo
 
     def load_file(self, file):
-        if not file: return ""
+        if not file:
+            return ""
+        # 修复：原实现硬编码 utf-8，且失败时返回字符串 "读取失败" —— 用户点翻译后
+        # 程序会把「读取失败」这四个字当成字幕内容翻译，并成功保存一个假结果。
+        # 现改为多编码尝试，失败时明确提示。
         try:
-            with open(file, 'r', encoding='utf-8') as f: return f.read()
-        except: return "读取失败"
+            raw = Path(file).read_bytes()
+            for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'gb18030'):
+                try:
+                    return raw.decode(enc)
+                except (UnicodeDecodeError, UnicodeError, LookupError):
+                    continue
+            return f"[读取失败] 无法识别文件编码，请另存为 UTF-8 或 GBK 后重试"
+        except Exception as e:
+            return f"[读取失败] {e}"
 
     def run_translation(self, content, api_key, base_url, model, target_lang, temp, batch_size, ctx_window, style, progress=gr.Progress()):
         if not content.strip(): return "请输入内容", None, "错误"
@@ -403,8 +456,11 @@ class TranslatorUI:
             )
             
             progress(0.9, desc="生成文件...")
+            # 修复：TXT 输入没有时间轴，不能存成 .srt
+            has_timecode = bool(translated_subs) and 'start_time' in translated_subs[0]
             srt_content = self.translator.generate_bilingual_srt(translated_subs, style)
-            file_path = self.translator.save_results(srt_content, "translated")
+            file_path = self.translator.save_results(
+                srt_content, "translated", "srt" if has_timecode else "txt")
             
             preview = "\n\n".join([f"【原】{s['original_text']}\n【译】{s['translated_text']}" for s in translated_subs[:5]])
             
@@ -413,7 +469,25 @@ class TranslatorUI:
         except Exception as e:
             return "", None, f"❌ 翻译出错: {str(e)}"
 
+# 端口候选。
+# 修复：原先硬编码 7869 且**没有回退**。虽然 7869 目前与主界面 7868 不冲突，
+# 但主界面支持 --port 参数、且本脚本重复启动时会撞自己，
+# 这里补上回退，避免端口被占用时直接抛 OSError 崩掉。
+LAUNCH_PORTS = [7869, 7870, 7871]
+
+
+def launch_server():
+    """依次尝试候选端口启动，全部被占用时明确报错而不是静默崩掉。"""
+    for port in LAUNCH_PORTS:
+        try:
+            demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=True)
+            return
+        except OSError:
+            print(f"端口 {port} 被占用，尝试下一个...")
+    print(f"[错误] 候选端口全部被占用，无法启动: {LAUNCH_PORTS}")
+
+
 if __name__ == "__main__":
     ui = TranslatorUI()
     demo = ui.create_interface()
-    demo.launch(server_name="127.0.0.1", server_port=7869, inbrowser=True)
+    launch_server()

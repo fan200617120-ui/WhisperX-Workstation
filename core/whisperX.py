@@ -29,7 +29,10 @@ def clean_old_logs(days=7):
 
 clean_old_logs()
 log_file = LOG_DIR / f"error_{time.strftime('%Y%m%d')}.log"
-logging.basicConfig(filename=log_file, level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+# 修复：原级别为 logging.ERROR，但代码里大量关键信息用 logger.warning / logger.info 输出
+# （例如「精细对齐出错，将使用原始时间戳」），这些永远不会落盘，
+# 用户界面上只看到「完成」，无从知道精细对齐其实没生效。改为 INFO。
+logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==================== 路径 ====================
@@ -52,6 +55,50 @@ config_lock = threading.RLock()
 
 CACHE_DIR = ROOT_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+# ==================== 陈旧缓存清理 ====================
+# 为什么要这个：预处理副本（*_16k_mono.wav，51 分钟音频约 98MB）和视频抽音轨的
+# 临时 wav 在任务正常结束时会清理（cleanup_temp），但**进程被强杀或崩溃时不会**。
+# 实测 cache/ 曾积到 477MB，其中约 210MB 是一次异常退出的残留。
+#
+# 只删「超过 CACHE_TTL_HOURS 的」，所以本次会话正在用的文件（几分钟前才创建）
+# 不会被碰到；即使有另一个脚本正在跑长任务，它的临时文件也不会老到这个岁数
+# （没有任何单文件转写会跑满 12 小时）。
+CACHE_TTL_HOURS = 12
+
+def clean_old_cache_files(hours=CACHE_TTL_HOURS):
+    """清理 cache/ 里陈旧的任务临时文件，返回删除数量。
+
+    两道条件都满足才删，避免误伤用户自己放进 cache/ 的东西：
+      1. 文件名像程序自己产生的（tmp* / sub_*）且扩展名是 .wav / .srt；
+      2. 修改时间早于 hours 小时前。
+    子目录一律不动。
+    """
+    cutoff = time.time() - hours * 3600
+    removed = 0
+    try:
+        for f in CACHE_DIR.iterdir():
+            if f.is_dir() or f.suffix.lower() not in (".wav", ".srt"):
+                continue
+            name = f.name.lower()
+            if not name.isascii():
+                continue        # 中文名基本都是用户自己放进来的素材
+            if not (name.startswith("tmp") or name.startswith("sub_")):
+                continue
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
+_cleaned_cache = clean_old_cache_files()
+if _cleaned_cache:
+    print(f"已清理 {_cleaned_cache} 个陈旧缓存文件"
+          f"（cache/ 中超过 {CACHE_TTL_HOURS} 小时的临时音频）")
 
 # ==================== FFmpeg ====================
 PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
@@ -86,8 +133,11 @@ def save_settings(settings):
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        # 修复：原来静默吞掉，设置写盘失败（磁盘满/无权限/文件被占用）时
+        # 用户改了输出目录却不知道为什么没生效
+        print(f"[WARN] 设置保存失败（{CONFIG_FILE}）: {e}")
+        logger.warning(f"设置保存失败: {e}")
 
 # ==================== 导入依赖 ====================
 try:
@@ -443,6 +493,35 @@ def match_local_align_by_lang(lang, local_align):
                 return path
     return None
 
+# ==================== 精度支持查询 ====================
+# 精度候选（顺序即下拉框显示顺序，与原默认保持一致：int8_float32 优先）
+_COMPUTE_PREFERENCE = ["int8_float32", "float16", "float32", "int8_float16",
+                       "int8", "int16", "bfloat16"]
+
+
+def supported_compute_types(device):
+    """查询 CTranslate2 在该设备上**真正支持**的精度。
+
+    修复：界面原本无条件提供 ["int8_float32", "float16", "float32"]，
+    但 float16 能不能用取决于显卡。实测 GTX 1080（算力 6.1）在
+    ctranslate2 4.4.0 下 CUDA 只支持 {int8, int8_float32, float32}，
+    **不支持 float16** —— 用户在下拉框选了 float16 必然报
+    "Requested float16 compute type, but the target device or backend
+     do not support efficient float16 computation."。
+    现改为按实际支持的精度构造下拉框，并在加载时做运行时校验。
+    """
+    try:
+        import ctranslate2
+        supported = set(ctranslate2.get_supported_compute_types(device))
+    except Exception as e:
+        print(f"[WARN] 无法查询 {device} 支持的精度（{e}），回退默认列表")
+        supported = {"int8_float32", "float32"}
+        if device != "cpu":
+            supported.add("float16")
+    choices = [c for c in _COMPUTE_PREFERENCE if c in supported]
+    return choices or ["int8_float32", "float32"]
+
+
 # ==================== 模型管理器 ====================
 class WhisperXManager:
     def __init__(self):
@@ -477,6 +556,16 @@ class WhisperXManager:
         return models
 
     def get_local_align_models(self):
+        """扫描本地对齐模型。
+
+        修复：原实现只认「把模型文件直接解压到 pretrained_models/<名字>/」这种布局，
+        而 whisperx 的 load_align_model 用的是
+        `from_pretrained(model_name, cache_dir=model_dir)`，
+        下载后落地结构是 pretrained_models/models--org--name/snapshots/<hash>/，
+        该目录下只有 blobs/refs/snapshots，没有 config.json → 被原条件排除。
+        结果：用户下载好的对齐模型在下拉框里看不到，只能选 "auto"；
+        离线环境下自动下载必然失败，而失败又被静默吞掉。
+        """
         models = []
         models_dir = ROOT_DIR / "pretrained_models"
         if not models_dir.exists():
@@ -484,18 +573,38 @@ class WhisperXManager:
         for item in models_dir.iterdir():
             if not item.is_dir():
                 continue
-            if "wav2vec2" in item.name.lower() or "xlsr" in item.name.lower():
-                if ((item / "pytorch_model.bin").exists() or (item / "model.bin").exists() or (item / "config.json").exists()):
-                    models.append((item.name, str(item)))
+            name = item.name.lower()
+            if "wav2vec2" not in name and "xlsr" not in name:
+                continue
+            # 布局1：直放目录
+            if ((item / "pytorch_model.bin").exists() or (item / "model.bin").exists()
+                    or (item / "config.json").exists()):
+                models.append((item.name, str(item)))
+                continue
+            # 布局2：HuggingFace 缓存布局 models--org--name/snapshots/<hash>/
+            snapshots = item / "snapshots"
+            if snapshots.is_dir():
+                for snap in sorted(snapshots.iterdir()):
+                    if not snap.is_dir():
+                        continue
+                    if ((snap / "config.json").exists()
+                            or (snap / "pytorch_model.bin").exists()
+                            or (snap / "model.safetensors").exists()):
+                        models.append((item.name, str(snap)))
+                        break
         return models
 
     def load_asr_model(self, model_size, device, compute_type):
         with self.lock:
             if not model_size:
                 return False, "未发现模型：请先在 pretrained_models 目录放置模型文件，然后刷新页面后重试"
-            # 修复：CPU 下 float16 校验
-            if device == "cpu" and compute_type == "float16":
-                return False, "CPU 模式不支持 float16，请选择 int8_float32 或 float32"
+            # 修复：原校验只拦 CPU+float16。实测 GTX 1080 上 CUDA 也不支持 float16
+            # （ctranslate2 4.4.0 在算力 6.1 上只给 {int8, int8_float32, float32}），
+            # 现改为按「该设备实际支持的精度」做通用校验。
+            _ok_types = supported_compute_types(device)
+            if compute_type not in _ok_types:
+                return False, (f"{device} 不支持 {compute_type}，"
+                               f"请选择: {'、'.join(_ok_types)}")
             local_path = ROOT_DIR / "pretrained_models" / model_size
             if local_path.exists() and ((local_path / "model.bin").exists() or (local_path / "config.json").exists()):
                 model_name_or_path = str(local_path)
@@ -702,13 +811,17 @@ class WhisperXManager:
             try:
                 cmd = [FFMPEG_PATH, "-y", "-i", audio_input, "-ar", "16000",
                        "-ac", "1", "-c:a", "pcm_s16le", temp_16k]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+                # 修复：原来没设 text/encoding，stderr 是 bytes 且被丢弃，
+                # 失败时只看到 "returned non-zero exit status 1"，无法定位原因
+                subprocess.run(cmd, check=True, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', timeout=600)
             except Exception as e:
+                stderr = getattr(e, 'stderr', '') or ''
                 try:
                     os.unlink(temp_16k)
                 except Exception:
                     pass
-                logger.error(f"音频预处理失败: {e}")
+                logger.error(f"音频预处理失败: {e}\n{(stderr or '')[-500:]}")
                 return None
             self.temp_files.append(temp_16k)
             return temp_16k
@@ -825,7 +938,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
         temp_audio_path = audio_path
         cmd = [FFMPEG_PATH, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
                "-ar", "16000", "-ac", "1", "-y", audio_path]
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
         progress(0.4, desc="转写中...")
         lang = _norm_lang(language)
         prompt = hotwords.strip() if hotwords else None
@@ -865,7 +979,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             cmd = [FFMPEG_PATH, "-i", video_path, "-i", str(srt_path), "-c", "copy",
                    "-c:s", "mov_text", "-metadata:s:s:0", f"language={sub_lang_code}",
                    "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
         else:
             safe_srt_temp = os.path.join(str(CACHE_DIR), f"sub_{uuid.uuid4().hex[:8]}.srt")
             shutil.copy2(str(srt_path), safe_srt_temp)
@@ -878,7 +993,8 @@ def transcribe_video(video, model_size, device, compute_type, language, beam_siz
             vf_str = (f"subtitles='{escaped_srt}':force_style='FontName={font_name},"
                       f"FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H000000,BorderStyle=3'")
             cmd = [FFMPEG_PATH, "-i", video_path, "-vf", vf_str, "-c:a", "copy", "-y", str(out_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=3600)
+            subprocess.run(cmd, check=True, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=3600)
         result_msg = (f"✅ 处理完成！输出视频: {out_path.name}\n"
                       f"字幕文件已保存至 output 目录。\n\n【识别文本】\n{full_text}")
         progress(1.0, desc="完成")
@@ -1013,7 +1129,11 @@ def create_interface():
         device_choices = ["cuda", "cpu"]
     else:
         device_choices = ["cpu"]
-    compute_choices = ["int8_float32", "float16", "float32"]
+    # 修复：原写法硬编码 ["int8_float32","float16","float32"]，无条件提供 float16。
+    # 实测 GTX 1080（算力 6.1）在 ctranslate2 4.4.0 下 CUDA 不支持 float16，
+    # 用户选了必然加载失败。现按该设备实际支持的精度构造。
+    compute_choices = supported_compute_types(device_choices[0])
+    print(f"[OK] {device_choices[0]} 支持的精度: {compute_choices}")
     align_local = manager.get_local_align_models()
     align_options = ["auto"] + [name for name, _ in align_local]
 
@@ -1025,7 +1145,7 @@ def create_interface():
                 model_size = gr.Dropdown(label="模型大小", choices=model_choices,
                                          value=model_choices[0] if model_choices else None,
                                          interactive=bool(model_choices))
-                compute_type = gr.Dropdown(label="计算类型", choices=compute_choices, value="int8_float32")
+                compute_type = gr.Dropdown(label="计算类型", choices=compute_choices, value=compute_choices[0])
                 # 修复：语言下拉 + auto 自动检测
                 language = gr.Dropdown(label="语言 (auto=自动检测)", choices=LANG_CHOICES,
                                        value="auto", allow_custom_value=True)
